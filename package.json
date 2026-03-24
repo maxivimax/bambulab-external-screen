@@ -1,0 +1,11 @@
+{
+  "name": "bambulab-screen-tools",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "live-bridge": "node tools/live_preview_bridge.mjs"
+  },
+  "dependencies": {
+    "mqtt": "^5.10.4"
+  }
+}

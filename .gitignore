@@ -1,0 +1,5 @@
+.pio/
+.pio-core/
+compile_commands.json
+
+node_modules
