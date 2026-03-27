@@ -4,7 +4,7 @@
 #define LV_COLOR_DEPTH 16
 #define LV_COLOR_16_SWAP 0
 #define LV_MEM_CUSTOM 0
-#define LV_MEM_SIZE (128U * 1024U)
+#define LV_MEM_SIZE (48U * 1024U)
 #define LV_DEF_REFR_PERIOD 16
 #define LV_DPI_DEF 130
 
@@ -21,6 +21,7 @@
 #define LV_USE_LABEL 1
 #define LV_USE_BAR 1
 #define LV_USE_LINE 1
+#define LV_USE_CHART 1
 
 #define LV_USE_THEME_DEFAULT 1
 #define LV_USE_PERF_MONITOR 0

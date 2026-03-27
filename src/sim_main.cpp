@@ -6,6 +6,7 @@
 #include <string>
 #include <unistd.h>
 
+#include "app_config.h"
 #include "printer_state.h"
 #include "ui.h"
 
@@ -14,7 +15,7 @@
 namespace {
 
 lv_disp_draw_buf_t drawBuf;
-lv_color_t buf1[240 * 40];
+lv_color_t buf1[LCD_HOR_RES * 30];
 PrinterState mockState = makeDefaultPrinterState();
 uint32_t lastTickMs = 0;
 uint32_t lastMockUpdateMs = 0;
@@ -110,13 +111,14 @@ void initDisplay() {
   sdl_init();
 
   lv_disp_draw_buf_init(&drawBuf, buf1, nullptr, 240 * 40);
+  lv_disp_draw_buf_init(&drawBuf, buf1, nullptr, LCD_HOR_RES * 30);
 
   static lv_disp_drv_t dispDrv;
   lv_disp_drv_init(&dispDrv);
   dispDrv.flush_cb = sdl_display_flush;
   dispDrv.draw_buf = &drawBuf;
-  dispDrv.hor_res = 240;
-  dispDrv.ver_res = 320;
+  dispDrv.hor_res = LCD_HOR_RES;
+  dispDrv.ver_res = LCD_VER_RES;
   lv_disp_drv_register(&dispDrv);
 
   static lv_indev_drv_t mouseDrv;

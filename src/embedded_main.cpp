@@ -1,7 +1,9 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <LovyanGFX.hpp>
+#include <Preferences.h>
 #include <PubSubClient.h>
+#include <SPI.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <lvgl.h>
@@ -18,7 +20,7 @@ class LGFX : public lgfx::LGFX_Device {
  public:
   LGFX() {
     auto busCfg = bus_.config();
-    busCfg.spi_host = SPI2_HOST;
+    busCfg.spi_host = HSPI_HOST;
     busCfg.spi_mode = 0;
     busCfg.freq_write = 27000000;
     busCfg.freq_read = 16000000;
@@ -80,16 +82,280 @@ unsigned long lastMqttAttemptMs = 0;
 unsigned long lastPushallMs = 0;
 unsigned long lastTickMs = 0;
 unsigned long lastUiRefreshMs = 0;
+uint8_t currentBrightness = 192;
+SPIClass touchSpi(VSPI);
+lv_indev_drv_t indevDrv;
+Preferences preferences;
 
 lv_disp_draw_buf_t drawBuf;
 lv_color_t *drawBuffer = nullptr;
 lv_disp_drv_t dispDrv;
+
+struct TouchCalibration {
+  int rawMinX = TOUCH_RAW_MIN_X;
+  int rawMaxX = TOUCH_RAW_MAX_X;
+  int rawMinY = TOUCH_RAW_MIN_Y;
+  int rawMaxY = TOUCH_RAW_MAX_Y;
+  bool invertX = TOUCH_INVERT_X;
+  bool invertY = TOUCH_INVERT_Y;
+};
+
+TouchCalibration touchCalibration;
+bool calibrationActive = false;
+bool calibrationTouchHeld = false;
+uint8_t calibrationStep = 0;
+uint32_t calibrationAccumX = 0;
+uint32_t calibrationAccumY = 0;
+uint16_t calibrationSampleCount = 0;
+struct RawPoint {
+  int x;
+  int y;
+};
+RawPoint calibrationPoints[4] = {};
+
+constexpr int kCalibrationTargetXs[4] = {24, LCD_HOR_RES - 25, LCD_HOR_RES - 25, 24};
+constexpr int kCalibrationTargetYs[4] = {24, 24, LCD_VER_RES - 25, LCD_VER_RES - 25};
+
+bool readTouchRaw(int &rawX, int &rawY);
 
 String makeClientId() {
   const uint64_t chipId = ESP.getEfuseMac();
   char buffer[32];
   snprintf(buffer, sizeof(buffer), "leaf-s3-%04X", static_cast<unsigned>(chipId & 0xFFFF));
   return String(buffer);
+}
+
+uint8_t brightnessToPercent(uint8_t value) {
+  const uint8_t logicalValue = LCD_BL_INVERT ? static_cast<uint8_t>(255U - value) : value;
+  return static_cast<uint8_t>((static_cast<uint16_t>(logicalValue) * 100U) / 255U);
+}
+
+void applyBrightness(uint8_t brightness) {
+  currentBrightness = brightness;
+  lcd.setBrightness(currentBrightness);
+  ui::setBrightnessPercent(brightnessToPercent(currentBrightness));
+}
+
+uint8_t logicalBrightnessToHardware(uint8_t logicalValue) {
+  return LCD_BL_INVERT ? static_cast<uint8_t>(255U - logicalValue) : logicalValue;
+}
+
+int extrapolateRaw(int screenValueA, int screenValueB, int rawValueA, int rawValueB, int targetScreenValue) {
+  const int screenSpan = screenValueB - screenValueA;
+  if (screenSpan == 0) return rawValueA;
+  const long rawSpan = static_cast<long>(rawValueB) - static_cast<long>(rawValueA);
+  const long screenOffset = static_cast<long>(targetScreenValue) - static_cast<long>(screenValueA);
+  return rawValueA + static_cast<int>((rawSpan * screenOffset) / screenSpan);
+}
+
+void saveTouchCalibration() {
+  if (!preferences.begin("touch", false)) return;
+  preferences.putBool("valid", true);
+  preferences.putInt("minx", touchCalibration.rawMinX);
+  preferences.putInt("maxx", touchCalibration.rawMaxX);
+  preferences.putInt("miny", touchCalibration.rawMinY);
+  preferences.putInt("maxy", touchCalibration.rawMaxY);
+  preferences.putBool("invx", touchCalibration.invertX);
+  preferences.putBool("invy", touchCalibration.invertY);
+  preferences.end();
+}
+
+void saveBrightnessPreference() {
+  if (!preferences.begin("display", false)) return;
+  preferences.putUChar("brightness", currentBrightness);
+  preferences.end();
+}
+
+void loadTouchCalibration() {
+  if (!preferences.begin("touch", true)) return;
+  const bool valid = preferences.getBool("valid", false);
+  if (valid) {
+    touchCalibration.rawMinX = preferences.getInt("minx", TOUCH_RAW_MIN_X);
+    touchCalibration.rawMaxX = preferences.getInt("maxx", TOUCH_RAW_MAX_X);
+    touchCalibration.rawMinY = preferences.getInt("miny", TOUCH_RAW_MIN_Y);
+    touchCalibration.rawMaxY = preferences.getInt("maxy", TOUCH_RAW_MAX_Y);
+    touchCalibration.invertX = preferences.getBool("invx", TOUCH_INVERT_X);
+    touchCalibration.invertY = preferences.getBool("invy", TOUCH_INVERT_Y);
+  }
+  preferences.end();
+}
+
+void loadBrightnessPreference() {
+  if (!preferences.begin("display", true)) return;
+  currentBrightness = preferences.getUChar("brightness", logicalBrightnessToHardware(192));
+  preferences.end();
+  if (LCD_BL_INVERT && currentBrightness >= 250) {
+    currentBrightness = logicalBrightnessToHardware(192);
+  }
+}
+
+void beginTouchCalibration() {
+  calibrationActive = true;
+  calibrationTouchHeld = false;
+  calibrationStep = 0;
+  calibrationAccumX = 0;
+  calibrationAccumY = 0;
+  calibrationSampleCount = 0;
+  ui::showCalibrationStep(1, 4, kCalibrationTargetXs[0], kCalibrationTargetYs[0]);
+  Serial.println("Touch calibration started");
+}
+
+void finishTouchCalibration() {
+  const int leftRawX = (calibrationPoints[0].x + calibrationPoints[3].x) / 2;
+  const int rightRawX = (calibrationPoints[1].x + calibrationPoints[2].x) / 2;
+  const int topRawY = (calibrationPoints[0].y + calibrationPoints[1].y) / 2;
+  const int bottomRawY = (calibrationPoints[2].y + calibrationPoints[3].y) / 2;
+
+  const int rawXAtZero = extrapolateRaw(kCalibrationTargetXs[0], kCalibrationTargetXs[1], leftRawX,
+                                        rightRawX, 0);
+  const int rawXAtMax = extrapolateRaw(kCalibrationTargetXs[0], kCalibrationTargetXs[1], leftRawX,
+                                       rightRawX, LCD_HOR_RES - 1);
+  const int rawYAtZero = extrapolateRaw(kCalibrationTargetYs[0], kCalibrationTargetYs[3], topRawY,
+                                        bottomRawY, 0);
+  const int rawYAtMax = extrapolateRaw(kCalibrationTargetYs[0], kCalibrationTargetYs[3], topRawY,
+                                       bottomRawY, LCD_VER_RES - 1);
+
+  touchCalibration.rawMinX = min(rawXAtZero, rawXAtMax);
+  touchCalibration.rawMaxX = max(rawXAtZero, rawXAtMax);
+  touchCalibration.rawMinY = min(rawYAtZero, rawYAtMax);
+  touchCalibration.rawMaxY = max(rawYAtZero, rawYAtMax);
+  touchCalibration.invertX = leftRawX > rightRawX;
+  touchCalibration.invertY = topRawY > bottomRawY;
+
+  saveTouchCalibration();
+  calibrationActive = false;
+  ui::hideCalibration();
+
+  Serial.printf("Touch calibration saved: minX=%d maxX=%d minY=%d maxY=%d invX=%d invY=%d\n",
+                touchCalibration.rawMinX, touchCalibration.rawMaxX, touchCalibration.rawMinY,
+                touchCalibration.rawMaxY, touchCalibration.invertX, touchCalibration.invertY);
+}
+
+void processTouchCalibration() {
+  if (!calibrationActive) return;
+
+  int rawX = 0;
+  int rawY = 0;
+  const bool pressed = readTouchRaw(rawX, rawY);
+  if (!pressed) {
+    if (calibrationTouchHeld && calibrationSampleCount > 0) {
+      calibrationPoints[calibrationStep].x = calibrationAccumX / calibrationSampleCount;
+      calibrationPoints[calibrationStep].y = calibrationAccumY / calibrationSampleCount;
+      calibrationStep++;
+      calibrationAccumX = 0;
+      calibrationAccumY = 0;
+      calibrationSampleCount = 0;
+      calibrationTouchHeld = false;
+
+      if (calibrationStep >= 4) {
+        finishTouchCalibration();
+      } else {
+        ui::showCalibrationStep(calibrationStep + 1, 4, kCalibrationTargetXs[calibrationStep],
+                                kCalibrationTargetYs[calibrationStep]);
+      }
+    }
+    return;
+  }
+
+  calibrationTouchHeld = true;
+  calibrationAccumX += rawX;
+  calibrationAccumY += rawY;
+  calibrationSampleCount++;
+}
+
+void handleUiAction(ui::Action action) {
+  switch (action) {
+    case ui::Action::StartTouchCalibration:
+      beginTouchCalibration();
+      break;
+    case ui::Action::SetBrightnessLow:
+      applyBrightness(logicalBrightnessToHardware(72));
+      saveBrightnessPreference();
+      break;
+    case ui::Action::SetBrightnessMid:
+      applyBrightness(logicalBrightnessToHardware(160));
+      saveBrightnessPreference();
+      break;
+    case ui::Action::SetBrightnessMax:
+      applyBrightness(logicalBrightnessToHardware(255));
+      saveBrightnessPreference();
+      break;
+  }
+}
+
+uint16_t readTouchChannel(uint8_t command) {
+  SPISettings settings(2500000, MSBFIRST, SPI_MODE0);
+  touchSpi.beginTransaction(settings);
+  digitalWrite(TOUCH_CS_PIN, LOW);
+  touchSpi.transfer(command);
+  uint16_t raw = touchSpi.transfer16(0x0000) >> 3;
+  digitalWrite(TOUCH_CS_PIN, HIGH);
+  touchSpi.endTransaction();
+  return raw;
+}
+
+bool readTouchRaw(int &rawX, int &rawY) {
+  if (TOUCH_IRQ_PIN >= 0 && digitalRead(TOUCH_IRQ_PIN) == HIGH) {
+    return false;
+  }
+
+  uint32_t rawXAccum = 0;
+  uint32_t rawYAccum = 0;
+  constexpr int samples = 4;
+  for (int i = 0; i < samples; ++i) {
+    rawXAccum += readTouchChannel(0xD0);
+    rawYAccum += readTouchChannel(0x90);
+  }
+  rawXAccum /= samples;
+  rawYAccum /= samples;
+
+  int tx = static_cast<int>(rawXAccum);
+  int ty = static_cast<int>(rawYAccum);
+
+  if (TOUCH_SWAP_XY) {
+    const int tmp = tx;
+    tx = ty;
+    ty = tmp;
+  }
+
+  rawX = tx;
+  rawY = ty;
+  return true;
+}
+
+bool readTouchPoint(int &x, int &y) {
+  int rawX = 0;
+  int rawY = 0;
+  if (!readTouchRaw(rawX, rawY)) {
+    return false;
+  }
+
+  int tx = map(rawX, touchCalibration.rawMinX, touchCalibration.rawMaxX, 0, LCD_HOR_RES - 1);
+  int ty = map(rawY, touchCalibration.rawMinY, touchCalibration.rawMaxY, 0, LCD_VER_RES - 1);
+
+  if (touchCalibration.invertX) tx = (LCD_HOR_RES - 1) - tx;
+  if (touchCalibration.invertY) ty = (LCD_VER_RES - 1) - ty;
+
+  x = constrain(tx, 0, LCD_HOR_RES - 1);
+  y = constrain(ty, 0, LCD_VER_RES - 1);
+  return true;
+}
+
+void lvglTouchRead(lv_indev_drv_t *drv, lv_indev_data_t *data) {
+  LV_UNUSED(drv);
+  if (calibrationActive) {
+    data->state = LV_INDEV_STATE_REL;
+    return;
+  }
+  int x = 0;
+  int y = 0;
+  if (readTouchPoint(x, y)) {
+    data->state = LV_INDEV_STATE_PR;
+    data->point.x = x;
+    data->point.y = y;
+  } else {
+    data->state = LV_INDEV_STATE_REL;
+  }
 }
 
 template <typename T>
@@ -217,20 +483,33 @@ void setupDisplay() {
   lcd.init();
   lcd.setRotation(LCD_ROTATION);
   lcd.setSwapBytes(true);
-  lcd.setBrightness(192);
+  applyBrightness(currentBrightness);
+
+  pinMode(TOUCH_CS_PIN, OUTPUT);
+  digitalWrite(TOUCH_CS_PIN, HIGH);
+  if (TOUCH_IRQ_PIN >= 0) {
+    pinMode(TOUCH_IRQ_PIN, INPUT_PULLUP);
+  }
+  touchSpi.begin(TOUCH_CLK_PIN, TOUCH_MISO_PIN, TOUCH_MOSI_PIN, TOUCH_CS_PIN);
 
   lv_init();
   drawBuffer = static_cast<lv_color_t *>(
-      heap_caps_malloc(sizeof(lv_color_t) * 240 * 40, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-  lv_disp_draw_buf_init(&drawBuf, drawBuffer, nullptr, 240 * 40);
+      heap_caps_malloc(sizeof(lv_color_t) * LCD_HOR_RES * 24, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+  lv_disp_draw_buf_init(&drawBuf, drawBuffer, nullptr, LCD_HOR_RES * 24);
   lv_disp_drv_init(&dispDrv);
-  dispDrv.hor_res = 240;
-  dispDrv.ver_res = 320;
+  dispDrv.hor_res = LCD_HOR_RES;
+  dispDrv.ver_res = LCD_VER_RES;
   dispDrv.flush_cb = lvglFlush;
   dispDrv.draw_buf = &drawBuf;
   lv_disp_drv_register(&dispDrv);
 
+  lv_indev_drv_init(&indevDrv);
+  indevDrv.type = LV_INDEV_TYPE_POINTER;
+  indevDrv.read_cb = lvglTouchRead;
+  lv_indev_drv_register(&indevDrv);
+
   ui::init();
+  ui::setActionHandler(handleUiAction);
   ui::applyState(printer);
 }
 
@@ -249,6 +528,8 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  loadTouchCalibration();
+  loadBrightnessPreference();
   setupDisplay();
   validateConfig();
 
@@ -270,6 +551,7 @@ void loop() {
     lv_tick_inc(elapsed);
     lastTickMs = now;
   }
+  processTouchCalibration();
   lv_timer_handler();
 
   if (!configReady) {
