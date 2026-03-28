@@ -1,1120 +1,1380 @@
 #include "ui.h"
+#include "ui_icons.h"
 
-#include <ctype.h>
-#include <stdint.h>
+#include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 namespace ui {
 namespace {
 
 constexpr lv_coord_t kScreenW = 320;
 constexpr lv_coord_t kScreenH = 240;
-constexpr lv_coord_t kHeaderH = 22;
-constexpr lv_coord_t kPageY = 18;
-constexpr lv_coord_t kPageH = 218;
-constexpr lv_coord_t kPad = 12;
+constexpr lv_coord_t kRailW = 48;
+constexpr lv_coord_t kRailShellW = 60;
+constexpr lv_coord_t kContentX = kRailW;
+constexpr lv_coord_t kContentW = kScreenW - kContentX;
+constexpr lv_coord_t kCardRadius = 4;
+constexpr uint8_t kTempHistorySize = 24;
+constexpr uint32_t kTempSampleIntervalMs = 5000;
 
-constexpr uint32_t kAccentColor = 0xFF7A86;
-constexpr uint32_t kAccentSoft = 0x5A2B31;
-constexpr uint32_t kLiveColor = 0xFF98A0;
-constexpr uint32_t kTrackColor = 0x3A1B1F;
-constexpr uint32_t kOfflineDebounceMs = 4000;
-constexpr uint32_t kMenuAutoCloseMs = 10000;
+enum class Section : uint8_t { Home = 0, Temps = 1, Print = 2, System = 3, Menu = 4 };
+enum class IconId : uint8_t { Home, Temps, Print, System, Menu, Nozzle, Bed, Wifi, Speed, Layers };
+enum class SystemPane : uint8_t { Info = 0, Settings = 1 };
 
-enum class PageId : uint8_t { Summary, Heating, Temps, Details, Idle, Finish, Notice };
-enum class ViewMode : uint8_t { Heating, Printing, Paused, Finished, Idle, Offline };
-enum class MenuAction : uint8_t { AutoRotate, Summary, Temps, Details, Close };
+ActionHandler actionHandler = nullptr;
+PrinterState currentState = makeDefaultPrinterState();
+Section activeSection = Section::Home;
+uint8_t brightnessPercent = 75;
+SystemPane activeSystemPane = SystemPane::Info;
 
-struct PageSpec {
-  PageId id;
-  uint32_t durationMs;
-};
-
-constexpr PageSpec kPrintingPages[] = {
-    {PageId::Summary, 7000}, {PageId::Temps, 7000}, {PageId::Details, 3000}};
-constexpr PageSpec kHeatingPages[] = {
-    {PageId::Heating, 7000}, {PageId::Summary, 4000}, {PageId::Temps, 6000}};
-constexpr PageSpec kIdlePages[] = {{PageId::Idle, 8000}, {PageId::Temps, 6000}, {PageId::Details, 3000}};
-constexpr PageSpec kPausedPages[] = {{PageId::Summary, 7000}, {PageId::Temps, 7000}, {PageId::Details, 3000}};
-constexpr PageSpec kFinishedPages[] = {{PageId::Finish, 9000}, {PageId::Details, 4000}, {PageId::Temps, 5000}};
-constexpr PageSpec kOfflinePages[] = {{PageId::Notice, 8000}};
-
-lv_obj_t *screenObj = nullptr;
-lv_obj_t *statusLabel = nullptr;
-lv_obj_t *pageIndicatorTrack = nullptr;
-lv_obj_t *pageIndicatorFill = nullptr;
-lv_obj_t *tapLayer = nullptr;
-lv_obj_t *menuOverlay = nullptr;
-lv_obj_t *menuPanel = nullptr;
-lv_obj_t *menuTitle = nullptr;
-lv_obj_t *menuHint = nullptr;
-lv_obj_t *menuAutoBtn = nullptr;
-lv_obj_t *menuSummaryBtn = nullptr;
-lv_obj_t *menuTempsBtn = nullptr;
-lv_obj_t *menuDetailsBtn = nullptr;
-lv_obj_t *menuBrightnessLowBtn = nullptr;
-lv_obj_t *menuBrightnessMidBtn = nullptr;
-lv_obj_t *menuBrightnessMaxBtn = nullptr;
-lv_obj_t *menuCalibrateBtn = nullptr;
-lv_obj_t *menuCloseBtn = nullptr;
-lv_obj_t *calibrationOverlay = nullptr;
-lv_obj_t *calibrationTitle = nullptr;
-lv_obj_t *calibrationHint = nullptr;
-lv_obj_t *calibrationStepLabel = nullptr;
-lv_obj_t *calibrationCrossH = nullptr;
-lv_obj_t *calibrationCrossV = nullptr;
-lv_obj_t *calibrationStartBtn = nullptr;
-lv_obj_t *calibrationCancelBtn = nullptr;
-
-lv_obj_t *summaryPage = nullptr;
-lv_obj_t *heatingPage = nullptr;
-lv_obj_t *tempsPage = nullptr;
-lv_obj_t *detailsPage = nullptr;
-lv_obj_t *idlePage = nullptr;
-lv_obj_t *finishPage = nullptr;
-lv_obj_t *noticePage = nullptr;
-
-lv_obj_t *summaryStage = nullptr;
-lv_obj_t *summaryJob = nullptr;
-lv_obj_t *summaryProgress = nullptr;
-lv_obj_t *summaryPercent = nullptr;
-lv_obj_t *summaryEta = nullptr;
-lv_obj_t *summaryDoneAt = nullptr;
-lv_obj_t *summaryLayers = nullptr;
-lv_obj_t *summaryTimeline[4] = {};
-lv_obj_t *summaryTimelineLabels[4] = {};
-
-lv_obj_t *heatingTitle = nullptr;
-lv_obj_t *heatingSubtitle = nullptr;
-lv_obj_t *heatingNozzle = nullptr;
-lv_obj_t *heatingBed = nullptr;
-
-lv_obj_t *tempNozzle = nullptr;
-lv_obj_t *tempBed = nullptr;
-lv_obj_t *tempChart = nullptr;
-lv_obj_t *tempLegendNozzle = nullptr;
-lv_obj_t *tempLegendBed = nullptr;
-lv_chart_series_t *tempNozzleSeries = nullptr;
-lv_chart_series_t *tempBedSeries = nullptr;
-lv_coord_t nozzleHistory[20] = {};
-lv_coord_t bedHistory[20] = {};
-int lastHistoryPercent = -1;
-uint32_t lastHistorySampleMs = 0;
-
-lv_obj_t *detailState = nullptr;
-lv_obj_t *detailWifi = nullptr;
-lv_obj_t *detailJob = nullptr;
-lv_obj_t *detailType = nullptr;
-lv_obj_t *detailSpeed = nullptr;
-
-lv_obj_t *idleStatus = nullptr;
-lv_obj_t *idleJob = nullptr;
-lv_obj_t *idleTemp = nullptr;
-
-lv_obj_t *finishTitle = nullptr;
-lv_obj_t *finishJob = nullptr;
-lv_obj_t *finishLayers = nullptr;
-lv_obj_t *finishType = nullptr;
-
-lv_obj_t *noticeTitle = nullptr;
-lv_obj_t *noticeSubtitle = nullptr;
-lv_obj_t *noticeMetaA = nullptr;
-
+lv_style_t screenStyle;
+lv_style_t railStyle;
 lv_style_t pageStyle;
 lv_style_t cardStyle;
-lv_style_t titleStyle;
+lv_style_t accentCardStyle;
+lv_style_t navButtonStyle;
+lv_style_t navButtonActiveStyle;
+lv_style_t navIconImageStyle;
+lv_style_t navIconImageActiveStyle;
+lv_style_t subNavButtonActiveStyle;
+lv_style_t tinyStyle;
+lv_style_t labelStyle;
 lv_style_t valueStyle;
-lv_style_t compactValueStyle;
-lv_style_t heroStyle;
-lv_style_t subtleStyle;
-lv_style_t chipStyle;
+lv_style_t bigValueStyle;
+lv_style_t navIconStyle;
+lv_style_t navIconActiveStyle;
+lv_style_t overlayStyle;
+lv_style_t modalStyle;
+lv_style_t buttonStyle;
+lv_style_t buttonAccentStyle;
+lv_style_t liveStyle;
+lv_style_t staleStyle;
+lv_style_t homeCardTopStyle;
+lv_style_t homeCardBottomStyle;
+lv_style_t homeControlTextStyle;
+lv_style_t homeTitleStyle;
+lv_style_t homeBodyStyle;
 
-const PageSpec *activePages = nullptr;
-size_t activePageCount = 0;
-size_t currentPageIndex = 0;
-uint32_t pageStartedAtMs = 0;
-bool pagerInitialized = false;
-ViewMode currentMode = ViewMode::Idle;
-uint32_t offlineCandidateSinceMs = 0;
-bool menuOpen = false;
-uint32_t lastMenuInteractionMs = 0;
-bool manualPageActive = false;
-PageId manualPageId = PageId::Summary;
-bool calibrationVisible = false;
-ActionHandler actionHandler = nullptr;
-uint8_t currentBrightnessPercent = 100;
+lv_obj_t *root = nullptr;
+lv_obj_t *rail = nullptr;
+lv_obj_t *liveBadge = nullptr;
+lv_obj_t *navButtons[5] = {};
+lv_obj_t *navIcons[5] = {};
 
-const char *effectiveStage(const PrinterState &state) {
-  if (state.stageText[0] != '\0' && strcmp(state.stageText, "UNKNOWN") != 0) return state.stageText;
-  return state.printing ? "Printing" : "Idle";
+lv_obj_t *homePage = nullptr;
+lv_obj_t *tempsPage = nullptr;
+lv_obj_t *printPage = nullptr;
+lv_obj_t *systemPage = nullptr;
+lv_obj_t *menuPage = nullptr;
+lv_obj_t *systemInfoPane = nullptr;
+lv_obj_t *systemSettingsPane = nullptr;
+lv_obj_t *systemSubButtons[2] = {};
+lv_obj_t *systemSubIcons[2] = {};
+
+lv_obj_t *calibrationConfirmOverlay = nullptr;
+lv_obj_t *calibrationOverlay = nullptr;
+lv_obj_t *calibrationCross = nullptr;
+lv_obj_t *calibrationStepLabel = nullptr;
+
+lv_obj_t *homeJobLabel = nullptr;
+lv_obj_t *homePercentLabel = nullptr;
+lv_obj_t *homeProgressBar = nullptr;
+lv_obj_t *homeTitleLabel = nullptr;
+lv_obj_t *homeInitLabel = nullptr;
+lv_obj_t *homeProgressGroup = nullptr;
+lv_obj_t *homeStatsGroup = nullptr;
+lv_obj_t *homeControlsGroup = nullptr;
+lv_obj_t *homeLayersValue = nullptr;
+lv_obj_t *homeBedValue = nullptr;
+lv_obj_t *homeTimeValue = nullptr;
+lv_obj_t *homeNozzleValue = nullptr;
+lv_obj_t *homeControlBars[4] = {};
+
+lv_obj_t *tempsNozzleValue = nullptr;
+lv_obj_t *tempsBedValue = nullptr;
+lv_obj_t *tempsChart = nullptr;
+lv_chart_series_t *tempsNozzleSeries = nullptr;
+lv_chart_series_t *tempsBedSeries = nullptr;
+
+lv_obj_t *printJobLabel = nullptr;
+lv_obj_t *printProgressValue = nullptr;
+lv_obj_t *printRemainValue = nullptr;
+lv_obj_t *printLayersValue = nullptr;
+lv_obj_t *printSpeedValue = nullptr;
+lv_obj_t *printStateValue = nullptr;
+
+lv_obj_t *systemWifiValue = nullptr;
+lv_obj_t *systemMqttValue = nullptr;
+lv_obj_t *systemRamValue = nullptr;
+lv_obj_t *systemFlashValue = nullptr;
+lv_obj_t *systemTouchValue = nullptr;
+lv_obj_t *systemTypeValue = nullptr;
+lv_obj_t *systemCommandValue = nullptr;
+lv_obj_t *systemBrightnessButtons[3] = {};
+
+lv_obj_t *menuBrightnessValue = nullptr;
+lv_obj_t *menuWifiValue = nullptr;
+lv_obj_t *menuMqttValue = nullptr;
+lv_obj_t *menuPauseButton = nullptr;
+lv_obj_t *menuStopButton = nullptr;
+lv_obj_t *menuPauseLabel = nullptr;
+lv_obj_t *menuSpeedButtons[4] = {};
+
+int16_t nozzleHistory[kTempHistorySize] = {};
+int16_t bedHistory[kTempHistorySize] = {};
+bool historySeeded = false;
+uint32_t lastTempSampleMs = 0;
+
+const lv_color_t kBg = lv_color_hex(0x0F060D);
+const lv_color_t kRail = lv_color_hex(0x201720);
+const lv_color_t kPanel = lv_color_hex(0x201720);
+const lv_color_t kPanelAlt = lv_color_hex(0x201720);
+const lv_color_t kStroke = lv_color_hex(0x201720);
+const lv_color_t kText = lv_color_hex(0xFFFFFF);
+const lv_color_t kMuted = lv_color_hex(0xFFFFFF);
+const lv_color_t kAccent = lv_color_hex(0xEA12CD);
+const lv_color_t kAccentSoft = lv_color_hex(0xEA12CD);
+const lv_color_t kLive = lv_color_hex(0xEA12CD);
+const lv_color_t kStale = lv_color_hex(0x86909E);
+const lv_color_t kLineBed = lv_color_hex(0xFFFFFF);
+
+const char *iconText(IconId id) {
+  switch (id) {
+    case IconId::Home:
+      return LV_SYMBOL_HOME;
+    case IconId::Temps:
+      return LV_SYMBOL_SETTINGS;
+    case IconId::Print:
+      return LV_SYMBOL_EDIT;
+    case IconId::System:
+      return LV_SYMBOL_WIFI;
+    case IconId::Menu:
+      return LV_SYMBOL_LIST;
+    case IconId::Nozzle:
+      return LV_SYMBOL_CHARGE;
+    case IconId::Bed:
+      return LV_SYMBOL_DRIVE;
+    case IconId::Wifi:
+      return LV_SYMBOL_WIFI;
+    case IconId::Speed:
+      return LV_SYMBOL_LOOP;
+    case IconId::Layers:
+      return LV_SYMBOL_COPY;
+  }
+  return "";
 }
 
-bool isPausedState(const char *stage) {
-  return strcmp(stage, "PAUSE") == 0 || strcmp(stage, "PAUSED") == 0;
+const lv_img_dsc_t *railIconAsset(Section section) {
+  switch (section) {
+    case Section::Home:
+      return &ui_icon_home;
+    case Section::Temps:
+      return &ui_icon_temps;
+    case Section::Print:
+      return &ui_icon_print;
+    case Section::System:
+      return &ui_icon_system;
+    case Section::Menu:
+      return &ui_icon_menu;
+  }
+  return &ui_icon_home;
 }
 
-bool isFinishedState(const char *stage) {
-  return strcmp(stage, "FINISH") == 0 || strcmp(stage, "FINISHED") == 0 || strcmp(stage, "COMPLETED") == 0;
-}
-
-bool isHeatingState(const PrinterState &state) {
-  if (!state.printing) return false;
-  const bool nozzleHeating = state.nozzleTargetTemp > 0.0f && (state.nozzleTargetTemp - state.nozzleTemp) > 8.0f;
-  const bool bedHeating = state.bedTargetTemp > 0.0f && (state.bedTargetTemp - state.bedTemp) > 4.0f;
-  return nozzleHeating || bedHeating;
-}
-
-const char *speedLabel(int level) {
-  switch (level) {
-    case 1: return "Silent";
-    case 2: return "Standard";
-    case 3: return "Sport";
-    case 4: return "Ludicrous";
-    default: return "Standard";
+const lv_img_dsc_t *homeStatAsset(IconId id) {
+  switch (id) {
+    case IconId::Layers:
+      return &ui_icon_stack;
+    case IconId::Print:
+      return &ui_icon_timer;
+    case IconId::Bed:
+    case IconId::Nozzle:
+      return &ui_icon_thermo_small;
+    default:
+      return &ui_icon_stack;
   }
 }
 
-void formatDuration(int minutes, char *out, size_t size) {
+const lv_img_dsc_t *printStatAsset(IconId id) {
+  switch (id) {
+    case IconId::Print:
+      return &ui_icon_timer;
+    case IconId::Layers:
+      return &ui_icon_stack;
+    case IconId::Speed:
+      return &ui_icon_dashboard;
+    case IconId::Menu:
+      return &ui_icon_file_list;
+    case IconId::System:
+      return &ui_icon_restart;
+    default:
+      return &ui_icon_stack;
+  }
+}
+
+lv_coord_t homeStatIconX(IconId id) {
+  switch (id) {
+    case IconId::Layers:
+      return 88;
+    case IconId::Print:
+      return 89;
+    case IconId::Bed:
+    case IconId::Nozzle:
+      return 89;
+    default:
+      return 89;
+  }
+}
+
+lv_coord_t homeStatIconY(IconId id) {
+  switch (id) {
+    case IconId::Layers:
+      return 2;
+    case IconId::Print:
+      return 1;
+    case IconId::Bed:
+    case IconId::Nozzle:
+      return 1;
+    default:
+      return 1;
+  }
+}
+
+const char *speedText(int speedLevel) {
+  switch (speedLevel) {
+    case 1:
+      return "Silent";
+    case 2:
+      return "Standard";
+    case 3:
+      return "Sport";
+    case 4:
+      return "Ludicrous";
+    default:
+      return "Normal";
+  }
+}
+
+bool isHeating(const PrinterState &state) {
+  if (!state.hasData) return false;
+  if (strcmp(state.stageText, "PREPARE") == 0) return true;
+  if (state.nozzleTargetTemp > 0.0f && state.nozzleTemp + 5.0f < state.nozzleTargetTemp) return true;
+  if (state.bedTargetTemp > 0.0f && state.bedTemp + 3.0f < state.bedTargetTemp) return true;
+  return false;
+}
+
+const char *statusText(const PrinterState &state) {
+  if (!state.hasData || state.stale) return "Offline";
+  if (strcmp(state.stageText, "PAUSE") == 0) return "Paused";
+  if (strcmp(state.stageText, "FINISH") == 0) return "Finished";
+  if (isHeating(state)) return "Heating";
+  if (state.printing) return "Printing";
+  return "Ready";
+}
+
+void formatDuration(int minutes, char *buffer, size_t size) {
   if (minutes <= 0) {
-    snprintf(out, size, "0m");
+    snprintf(buffer, size, "Now");
     return;
   }
   const int hours = minutes / 60;
   const int mins = minutes % 60;
   if (hours > 0) {
-    snprintf(out, size, "%dh %02dm", hours, mins);
+    snprintf(buffer, size, "%dh %02dm", hours, mins);
   } else {
-    snprintf(out, size, "%dm", mins);
+    snprintf(buffer, size, "%dm", mins);
   }
 }
 
-void formatDisplayText(const char *input, char *output, size_t size) {
-  if (size == 0) return;
-  if (input == nullptr || input[0] == '\0') {
-    snprintf(output, size, "-");
-    return;
-  }
-
-  size_t out = 0;
-  bool newWord = true;
-  for (size_t i = 0; input[i] != '\0' && out + 1 < size; ++i) {
-    char c = input[i];
-    if (c == '_' || c == '-') {
-      if (out > 0 && output[out - 1] != ' ') output[out++] = ' ';
-      newWord = true;
-      continue;
-    }
-    const unsigned char uc = static_cast<unsigned char>(c);
-    output[out++] = newWord ? static_cast<char>(toupper(uc)) : static_cast<char>(tolower(uc));
-    newWord = false;
-  }
-  output[out] = '\0';
+void formatTemp(float current, float target, char *buffer, size_t size) {
+  snprintf(buffer, size, "%.0f / %.0f C", current, target);
 }
 
-void formatDoneAt(const PrinterState &state, char *output, size_t size) {
-  if (state.remainingMinutes <= 0) {
-    snprintf(output, size, "Done soon");
-    return;
-  }
-  const uint32_t nowMin = lv_tick_get() / 60000U;
-  const uint32_t doneMin = nowMin + static_cast<uint32_t>(state.remainingMinutes);
-  snprintf(output, size, "%02lu:%02lu",
-           static_cast<unsigned long>((doneMin / 60U) % 24U),
-           static_cast<unsigned long>(doneMin % 60U));
-}
-
-void setLabelText(lv_obj_t *obj, const char *text) { lv_label_set_text(obj, text); }
-void showOnly(PageId id);
-void setMenuVisible(bool visible);
-
-void setCalibrationVisible(bool visible) {
-  calibrationVisible = visible;
-  if (calibrationOverlay == nullptr) return;
-  if (visible) {
-    setMenuVisible(false);
-    if (tapLayer != nullptr) lv_obj_add_flag(tapLayer, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(calibrationOverlay, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(calibrationOverlay);
+void formatLayers(const PrinterState &state, char *buffer, size_t size) {
+  if (state.totalLayers > 0) {
+    snprintf(buffer, size, "%d / %d", state.currentLayer, state.totalLayers);
   } else {
-    lv_obj_add_flag(calibrationOverlay, LV_OBJ_FLAG_HIDDEN);
-    if (tapLayer != nullptr) lv_obj_clear_flag(tapLayer, LV_OBJ_FLAG_HIDDEN);
-  }
-  lv_obj_set_width(pageIndicatorFill, 0);
-}
-
-void setMenuVisible(bool visible) {
-  menuOpen = visible;
-  if (menuOverlay == nullptr) return;
-  if (visible) {
-    lv_obj_clear_flag(menuOverlay, LV_OBJ_FLAG_HIDDEN);
-    lastMenuInteractionMs = lv_tick_get();
-  } else {
-    lv_obj_add_flag(menuOverlay, LV_OBJ_FLAG_HIDDEN);
+    snprintf(buffer, size, "%d", state.currentLayer);
   }
 }
 
-void touchMenu() { lastMenuInteractionMs = lv_tick_get(); }
+const char *mqttStatus(const PrinterState &state) {
+  if (!state.hasData) return "No data";
+  if (state.stale) return "Offline";
+  return "Connected";
+}
 
-void tapEventHandler(lv_event_t *event) {
-  LV_UNUSED(event);
-  if (!menuOpen) {
-    setMenuVisible(true);
-  } else {
-    touchMenu();
+bool canControlPrint(const PrinterState &state) {
+  return state.hasData && !state.stale && state.printing;
+}
+
+bool isPaused(const PrinterState &state) { return strcmp(state.stageText, "PAUSE") == 0; }
+
+void seedHistory() {
+  for (uint8_t i = 0; i < kTempHistorySize; ++i) {
+    nozzleHistory[i] = static_cast<int16_t>(currentState.nozzleTemp);
+    bedHistory[i] = static_cast<int16_t>(currentState.bedTemp);
   }
+  historySeeded = true;
+  lastTempSampleMs = lv_tick_get();
 }
 
-void setManualPage(PageId id) {
-  manualPageActive = true;
-  manualPageId = id;
-  pageStartedAtMs = lv_tick_get();
-  showOnly(id);
-  lv_obj_set_width(pageIndicatorFill, 0);
-}
-
-void resumeAutoPaging() {
-  manualPageActive = false;
-  pageStartedAtMs = lv_tick_get();
-  if (pagerInitialized && activePageCount > 0) {
-    showOnly(activePages[currentPageIndex].id);
-  }
-}
-
-void menuOverlayEventHandler(lv_event_t *event) {
-  if (lv_event_get_target(event) == menuOverlay) {
-    setMenuVisible(false);
-  } else {
-    touchMenu();
-  }
-}
-
-void menuPanelEventHandler(lv_event_t *event) {
-  LV_UNUSED(event);
-  touchMenu();
-}
-
-void calibrateButtonHandler(lv_event_t *event) {
-  LV_UNUSED(event);
-  touchMenu();
-  setMenuVisible(false);
-  setCalibrationVisible(true);
-  lv_label_set_text(calibrationTitle, "Start Calibration?");
-  lv_label_set_text(calibrationHint, "Touch will be remapped after this step. Continue only if taps are off.");
-  lv_label_set_text(calibrationStepLabel, "Confirm");
-  lv_obj_add_flag(calibrationCrossH, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(calibrationCrossV, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_clear_flag(calibrationStartBtn, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_clear_flag(calibrationCancelBtn, LV_OBJ_FLAG_HIDDEN);
-}
-
-void calibrationStartHandler(lv_event_t *event) {
-  LV_UNUSED(event);
-  if (actionHandler != nullptr) {
-    actionHandler(Action::StartTouchCalibration);
-  }
-}
-
-void calibrationCancelHandler(lv_event_t *event) {
-  LV_UNUSED(event);
-  hideCalibration();
-}
-
-void brightnessButtonHandler(lv_event_t *event) {
-  touchMenu();
-  const auto action = static_cast<Action>(reinterpret_cast<intptr_t>(lv_event_get_user_data(event)));
-  if (actionHandler != nullptr) {
-    actionHandler(action);
-  }
-}
-
-void menuActionHandler(lv_event_t *event) {
-  touchMenu();
-  const auto action =
-      static_cast<MenuAction>(reinterpret_cast<intptr_t>(lv_event_get_user_data(event)));
-  switch (action) {
-    case MenuAction::AutoRotate:
-      resumeAutoPaging();
-      setMenuVisible(false);
-      break;
-    case MenuAction::Summary:
-      setManualPage(PageId::Summary);
-      setMenuVisible(false);
-      break;
-    case MenuAction::Temps:
-      setManualPage(PageId::Temps);
-      setMenuVisible(false);
-      break;
-    case MenuAction::Details:
-      setManualPage(PageId::Details);
-      setMenuVisible(false);
-      break;
-    case MenuAction::Close:
-      setMenuVisible(false);
-      break;
-  }
-}
-
-lv_obj_t *createMenuButton(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t w, lv_coord_t h,
-                           const char *text, MenuAction action) {
-  lv_obj_t *btn = lv_btn_create(parent);
-  lv_obj_remove_style_all(btn);
-  lv_obj_add_style(btn, &cardStyle, 0);
-  lv_obj_set_size(btn, w, h);
-  lv_obj_set_pos(btn, x, y);
-  lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(btn, menuActionHandler, LV_EVENT_CLICKED,
-                      reinterpret_cast<void *>(static_cast<intptr_t>(action)));
-
-  lv_obj_t *label = lv_label_create(btn);
-  lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(label, lv_color_hex(0xF5F7FA), 0);
-  lv_label_set_text(label, text);
-  lv_obj_center(label);
-  return btn;
-}
-
-lv_obj_t *createActionButton(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t w, lv_coord_t h,
-                             const char *text, Action action) {
-  lv_obj_t *btn = lv_btn_create(parent);
-  lv_obj_remove_style_all(btn);
-  lv_obj_add_style(btn, &cardStyle, 0);
-  lv_obj_set_size(btn, w, h);
-  lv_obj_set_pos(btn, x, y);
-  lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(btn, brightnessButtonHandler, LV_EVENT_CLICKED,
-                      reinterpret_cast<void *>(static_cast<intptr_t>(action)));
-
-  lv_obj_t *label = lv_label_create(btn);
-  lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(label, lv_color_hex(0xF5F7FA), 0);
-  lv_label_set_text(label, text);
-  lv_obj_center(label);
-  return btn;
-}
-
-void buildCalibrationOverlay() {
-  calibrationOverlay = lv_obj_create(screenObj);
-  lv_obj_remove_style_all(calibrationOverlay);
-  lv_obj_set_size(calibrationOverlay, kScreenW, kScreenH);
-  lv_obj_set_pos(calibrationOverlay, 0, 0);
-  lv_obj_set_style_bg_color(calibrationOverlay, lv_color_hex(0x05070A), 0);
-  lv_obj_set_style_bg_opa(calibrationOverlay, LV_OPA_COVER, 0);
-  lv_obj_add_flag(calibrationOverlay, LV_OBJ_FLAG_HIDDEN);
-
-  calibrationTitle = lv_label_create(calibrationOverlay);
-  lv_obj_set_style_text_font(calibrationTitle, &lv_font_montserrat_18, 0);
-  lv_obj_set_style_text_color(calibrationTitle, lv_color_hex(0xF5F7FA), 0);
-  lv_obj_set_pos(calibrationTitle, 14, 14);
-  lv_label_set_text(calibrationTitle, "Touch Calibration");
-
-  calibrationHint = lv_label_create(calibrationOverlay);
-  lv_obj_set_style_text_font(calibrationHint, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(calibrationHint, lv_color_hex(0xD8DEE7), 0);
-  lv_obj_set_width(calibrationHint, 290);
-  lv_label_set_long_mode(calibrationHint, LV_LABEL_LONG_WRAP);
-  lv_obj_set_pos(calibrationHint, 14, 44);
-  lv_label_set_text(calibrationHint, "Tap the pink cross, then release.");
-
-  calibrationStepLabel = lv_label_create(calibrationOverlay);
-  lv_obj_add_style(calibrationStepLabel, &titleStyle, 0);
-  lv_obj_set_pos(calibrationStepLabel, 14, 84);
-  lv_label_set_text(calibrationStepLabel, "1 / 4");
-
-  calibrationStartBtn = lv_btn_create(calibrationOverlay);
-  lv_obj_remove_style_all(calibrationStartBtn);
-  lv_obj_add_style(calibrationStartBtn, &cardStyle, 0);
-  lv_obj_set_size(calibrationStartBtn, 132, 38);
-  lv_obj_set_pos(calibrationStartBtn, 14, 120);
-  lv_obj_add_flag(calibrationStartBtn, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(calibrationStartBtn, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(calibrationStartBtn, calibrationStartHandler, LV_EVENT_CLICKED, nullptr);
-  lv_obj_t *startLabel = lv_label_create(calibrationStartBtn);
-  lv_obj_set_style_text_font(startLabel, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(startLabel, lv_color_hex(0xF5F7FA), 0);
-  lv_label_set_text(startLabel, "Start");
-  lv_obj_center(startLabel);
-
-  calibrationCancelBtn = lv_btn_create(calibrationOverlay);
-  lv_obj_remove_style_all(calibrationCancelBtn);
-  lv_obj_add_style(calibrationCancelBtn, &cardStyle, 0);
-  lv_obj_set_size(calibrationCancelBtn, 132, 38);
-  lv_obj_set_pos(calibrationCancelBtn, 174, 120);
-  lv_obj_add_flag(calibrationCancelBtn, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(calibrationCancelBtn, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(calibrationCancelBtn, calibrationCancelHandler, LV_EVENT_CLICKED, nullptr);
-  lv_obj_t *cancelLabel = lv_label_create(calibrationCancelBtn);
-  lv_obj_set_style_text_font(cancelLabel, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(cancelLabel, lv_color_hex(0xF5F7FA), 0);
-  lv_label_set_text(cancelLabel, "Cancel");
-  lv_obj_center(cancelLabel);
-
-  calibrationCrossH = lv_obj_create(calibrationOverlay);
-  lv_obj_remove_style_all(calibrationCrossH);
-  lv_obj_set_size(calibrationCrossH, 26, 2);
-  lv_obj_set_style_bg_color(calibrationCrossH, lv_color_hex(kAccentColor), 0);
-  lv_obj_set_style_bg_opa(calibrationCrossH, LV_OPA_COVER, 0);
-  lv_obj_add_flag(calibrationCrossH, LV_OBJ_FLAG_HIDDEN);
-
-  calibrationCrossV = lv_obj_create(calibrationOverlay);
-  lv_obj_remove_style_all(calibrationCrossV);
-  lv_obj_set_size(calibrationCrossV, 2, 26);
-  lv_obj_set_style_bg_color(calibrationCrossV, lv_color_hex(kAccentColor), 0);
-  lv_obj_set_style_bg_opa(calibrationCrossV, LV_OPA_COVER, 0);
-  lv_obj_add_flag(calibrationCrossV, LV_OBJ_FLAG_HIDDEN);
-}
-
-lv_obj_t *createPage() {
-  lv_obj_t *page = lv_obj_create(screenObj);
-  lv_obj_remove_style_all(page);
-  lv_obj_add_style(page, &pageStyle, 0);
-  lv_obj_set_pos(page, 0, kPageY);
-  lv_obj_set_size(page, kScreenW, kPageH);
-  return page;
-}
-
-lv_obj_t *createCard(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t w, lv_coord_t h) {
-  lv_obj_t *card = lv_obj_create(parent);
-  lv_obj_remove_style_all(card);
-  lv_obj_add_style(card, &cardStyle, 0);
-  lv_obj_set_pos(card, x, y);
-  lv_obj_set_size(card, w, h);
-  return card;
-}
-
-lv_obj_t *createCardTitle(lv_obj_t *card, const char *title) {
-  lv_obj_t *label = lv_label_create(card);
-  lv_obj_add_style(label, &titleStyle, 0);
-  lv_label_set_text(label, title);
-  lv_obj_set_pos(label, 8, 8);
-  return label;
-}
-
-lv_obj_t *createCardValue(lv_obj_t *card, lv_coord_t y, lv_style_t *style, lv_coord_t width) {
-  lv_obj_t *label = lv_label_create(card);
-  lv_obj_add_style(label, style, 0);
-  lv_obj_set_width(label, width);
-  lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
-  lv_obj_set_pos(label, 8, y);
-  lv_label_set_text(label, "-");
-  return label;
-}
-
-void showOnly(PageId id) {
-  lv_obj_add_flag(summaryPage, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(heatingPage, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(tempsPage, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(detailsPage, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(idlePage, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(finishPage, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(noticePage, LV_OBJ_FLAG_HIDDEN);
-
-  switch (id) {
-    case PageId::Summary: lv_obj_clear_flag(summaryPage, LV_OBJ_FLAG_HIDDEN); break;
-    case PageId::Heating: lv_obj_clear_flag(heatingPage, LV_OBJ_FLAG_HIDDEN); break;
-    case PageId::Temps: lv_obj_clear_flag(tempsPage, LV_OBJ_FLAG_HIDDEN); break;
-    case PageId::Details: lv_obj_clear_flag(detailsPage, LV_OBJ_FLAG_HIDDEN); break;
-    case PageId::Idle: lv_obj_clear_flag(idlePage, LV_OBJ_FLAG_HIDDEN); break;
-    case PageId::Finish: lv_obj_clear_flag(finishPage, LV_OBJ_FLAG_HIDDEN); break;
-    case PageId::Notice: lv_obj_clear_flag(noticePage, LV_OBJ_FLAG_HIDDEN); break;
-  }
-}
-
-void setActiveSequence(ViewMode mode) {
-  currentMode = mode;
-  switch (mode) {
-    case ViewMode::Heating: activePages = kHeatingPages; activePageCount = sizeof(kHeatingPages) / sizeof(kHeatingPages[0]); break;
-    case ViewMode::Printing: activePages = kPrintingPages; activePageCount = sizeof(kPrintingPages) / sizeof(kPrintingPages[0]); break;
-    case ViewMode::Paused: activePages = kPausedPages; activePageCount = sizeof(kPausedPages) / sizeof(kPausedPages[0]); break;
-    case ViewMode::Finished: activePages = kFinishedPages; activePageCount = sizeof(kFinishedPages) / sizeof(kFinishedPages[0]); break;
-    case ViewMode::Idle: activePages = kIdlePages; activePageCount = sizeof(kIdlePages) / sizeof(kIdlePages[0]); break;
-    case ViewMode::Offline: activePages = kOfflinePages; activePageCount = sizeof(kOfflinePages) / sizeof(kOfflinePages[0]); break;
-  }
-  currentPageIndex = 0;
-  pageStartedAtMs = lv_tick_get();
-  pagerInitialized = true;
-  showOnly(manualPageActive ? manualPageId : activePages[0].id);
-}
-
-void updatePager() {
-  if (!pagerInitialized || activePageCount == 0) return;
-  if (menuOpen || manualPageActive || calibrationVisible) {
-    lv_obj_set_width(pageIndicatorFill, 0);
+void pushTempSample() {
+  if (!historySeeded) {
+    seedHistory();
     return;
   }
   const uint32_t now = lv_tick_get();
-  const uint32_t duration = activePages[currentPageIndex].durationMs;
-  if ((now - pageStartedAtMs) >= duration) {
-    currentPageIndex = (currentPageIndex + 1) % activePageCount;
-    pageStartedAtMs = now;
-    showOnly(activePages[currentPageIndex].id);
-  }
-  const uint32_t progress = ((now - pageStartedAtMs) * kScreenW) / duration;
-  lv_obj_set_width(pageIndicatorFill, progress > kScreenW ? kScreenW : progress);
-}
-
-void updateMenuTimeout() {
-  if (!menuOpen) return;
-  const uint32_t now = lv_tick_get();
-  if ((now - lastMenuInteractionMs) >= kMenuAutoCloseMs) {
-    setMenuVisible(false);
-  }
-}
-
-ViewMode detectMode(const PrinterState &state) {
-  const char *stage = effectiveStage(state);
-  if (state.stale || !state.hasData) {
-    const uint32_t now = lv_tick_get();
-    if (offlineCandidateSinceMs == 0) offlineCandidateSinceMs = now;
-    if ((now - offlineCandidateSinceMs) >= kOfflineDebounceMs) return ViewMode::Offline;
-    return currentMode == ViewMode::Offline ? ViewMode::Offline : ViewMode::Idle;
-  }
-  offlineCandidateSinceMs = 0;
-  if (isPausedState(stage)) return ViewMode::Paused;
-  if (isFinishedState(stage)) return ViewMode::Finished;
-  if (isHeatingState(state)) return ViewMode::Heating;
-  if (state.printing) return ViewMode::Printing;
-  return ViewMode::Idle;
+  if ((now - lastTempSampleMs) < kTempSampleIntervalMs) return;
+  lastTempSampleMs = now;
+  memmove(&nozzleHistory[0], &nozzleHistory[1], sizeof(nozzleHistory[0]) * (kTempHistorySize - 1));
+  memmove(&bedHistory[0], &bedHistory[1], sizeof(bedHistory[0]) * (kTempHistorySize - 1));
+  nozzleHistory[kTempHistorySize - 1] = static_cast<int16_t>(lroundf(currentState.nozzleTemp));
+  bedHistory[kTempHistorySize - 1] = static_cast<int16_t>(lroundf(currentState.bedTemp));
 }
 
 void initStyles() {
+  lv_style_init(&screenStyle);
+  lv_style_set_bg_color(&screenStyle, kBg);
+  lv_style_set_bg_opa(&screenStyle, LV_OPA_COVER);
+  lv_style_set_border_width(&screenStyle, 0);
+  lv_style_set_radius(&screenStyle, 0);
+  lv_style_set_pad_all(&screenStyle, 0);
+
+  lv_style_init(&railStyle);
+  lv_style_set_bg_color(&railStyle, kRail);
+  lv_style_set_bg_opa(&railStyle, LV_OPA_COVER);
+  lv_style_set_border_width(&railStyle, 0);
+  lv_style_set_radius(&railStyle, 12);
+  lv_style_set_pad_all(&railStyle, 0);
+
   lv_style_init(&pageStyle);
   lv_style_set_bg_opa(&pageStyle, LV_OPA_TRANSP);
   lv_style_set_border_width(&pageStyle, 0);
+  lv_style_set_radius(&pageStyle, 0);
   lv_style_set_pad_all(&pageStyle, 0);
 
   lv_style_init(&cardStyle);
-  lv_style_set_radius(&cardStyle, 10);
-  lv_style_set_bg_color(&cardStyle, lv_color_hex(0x101419));
+  lv_style_set_bg_color(&cardStyle, kPanel);
   lv_style_set_bg_opa(&cardStyle, LV_OPA_COVER);
-  lv_style_set_border_color(&cardStyle, lv_color_hex(0x2C3642));
-  lv_style_set_border_width(&cardStyle, 1);
+  lv_style_set_border_width(&cardStyle, 0);
+  lv_style_set_radius(&cardStyle, kCardRadius);
+  lv_style_set_pad_all(&cardStyle, 8);
 
-  lv_style_init(&titleStyle);
-  lv_style_set_text_color(&titleStyle, lv_color_hex(0x93A1B2));
-  lv_style_set_text_font(&titleStyle, &lv_font_montserrat_12);
+  lv_style_init(&accentCardStyle);
+  lv_style_set_bg_color(&accentCardStyle, kPanelAlt);
+  lv_style_set_bg_opa(&accentCardStyle, LV_OPA_COVER);
+  lv_style_set_border_color(&accentCardStyle, kAccent);
+  lv_style_set_border_width(&accentCardStyle, 1);
+  lv_style_set_radius(&accentCardStyle, kCardRadius);
+  lv_style_set_pad_all(&accentCardStyle, 8);
+
+  lv_style_init(&navButtonStyle);
+  lv_style_set_bg_opa(&navButtonStyle, LV_OPA_TRANSP);
+  lv_style_set_border_width(&navButtonStyle, 0);
+  lv_style_set_radius(&navButtonStyle, 0);
+
+  lv_style_init(&navButtonActiveStyle);
+  lv_style_set_bg_color(&navButtonActiveStyle, kAccent);
+  lv_style_set_bg_opa(&navButtonActiveStyle, 13);
+  lv_style_set_border_side(&navButtonActiveStyle, LV_BORDER_SIDE_LEFT);
+  lv_style_set_border_color(&navButtonActiveStyle, kAccent);
+  lv_style_set_border_width(&navButtonActiveStyle, 3);
+  lv_style_set_radius(&navButtonActiveStyle, 0);
+
+  lv_style_init(&subNavButtonActiveStyle);
+  lv_style_set_bg_color(&subNavButtonActiveStyle, kAccent);
+  lv_style_set_bg_opa(&subNavButtonActiveStyle, 13);
+  lv_style_set_border_side(&subNavButtonActiveStyle, LV_BORDER_SIDE_RIGHT);
+  lv_style_set_border_color(&subNavButtonActiveStyle, kAccent);
+  lv_style_set_border_width(&subNavButtonActiveStyle, 3);
+  lv_style_set_radius(&subNavButtonActiveStyle, 0);
+
+  lv_style_init(&navIconImageStyle);
+  lv_style_set_img_recolor(&navIconImageStyle, kText);
+  lv_style_set_img_recolor_opa(&navIconImageStyle, LV_OPA_COVER);
+
+  lv_style_init(&navIconImageActiveStyle);
+  lv_style_set_img_recolor(&navIconImageActiveStyle, kAccent);
+  lv_style_set_img_recolor_opa(&navIconImageActiveStyle, LV_OPA_COVER);
+
+  lv_style_init(&tinyStyle);
+  lv_style_set_text_color(&tinyStyle, kText);
+  lv_style_set_text_font(&tinyStyle, &lv_font_montserrat_12);
+
+  lv_style_init(&labelStyle);
+  lv_style_set_text_color(&labelStyle, kText);
+  lv_style_set_text_font(&labelStyle, &lv_font_montserrat_14);
 
   lv_style_init(&valueStyle);
-  lv_style_set_text_color(&valueStyle, lv_color_hex(0xF5F7FA));
+  lv_style_set_text_color(&valueStyle, kText);
   lv_style_set_text_font(&valueStyle, &lv_font_montserrat_18);
 
-  lv_style_init(&compactValueStyle);
-  lv_style_set_text_color(&compactValueStyle, lv_color_hex(0xF5F7FA));
-  lv_style_set_text_font(&compactValueStyle, &lv_font_montserrat_14);
+  lv_style_init(&bigValueStyle);
+  lv_style_set_text_color(&bigValueStyle, kText);
+  lv_style_set_text_font(&bigValueStyle, &lv_font_montserrat_24);
 
-  lv_style_init(&heroStyle);
-  lv_style_set_text_color(&heroStyle, lv_color_hex(0xF5F7FA));
-  lv_style_set_text_font(&heroStyle, &lv_font_montserrat_24);
+  lv_style_init(&homeTitleStyle);
+  lv_style_set_text_color(&homeTitleStyle, kText);
+  lv_style_set_text_font(&homeTitleStyle, &lv_font_montserrat_16);
 
-  lv_style_init(&subtleStyle);
-  lv_style_set_text_color(&subtleStyle, lv_color_hex(0x93A1B2));
-  lv_style_set_text_font(&subtleStyle, &lv_font_montserrat_12);
+  lv_style_init(&homeBodyStyle);
+  lv_style_set_text_color(&homeBodyStyle, kText);
+  lv_style_set_text_font(&homeBodyStyle, &lv_font_montserrat_12);
 
-  lv_style_init(&chipStyle);
-  lv_style_set_bg_color(&chipStyle, lv_color_hex(0x2A2230));
-  lv_style_set_bg_opa(&chipStyle, LV_OPA_COVER);
-  lv_style_set_radius(&chipStyle, LV_RADIUS_CIRCLE);
+  lv_style_init(&homeControlTextStyle);
+  lv_style_set_text_color(&homeControlTextStyle, kText);
+  lv_style_set_text_font(&homeControlTextStyle, &lv_font_montserrat_12);
+
+  lv_style_init(&navIconStyle);
+  lv_style_set_text_color(&navIconStyle, kMuted);
+  lv_style_set_text_font(&navIconStyle, &lv_font_montserrat_18);
+
+  lv_style_init(&navIconActiveStyle);
+  lv_style_set_text_color(&navIconActiveStyle, kAccent);
+  lv_style_set_text_font(&navIconActiveStyle, &lv_font_montserrat_18);
+
+  lv_style_init(&overlayStyle);
+  lv_style_set_bg_color(&overlayStyle, lv_color_hex(0x000000));
+  lv_style_set_bg_opa(&overlayStyle, LV_OPA_60);
+  lv_style_set_border_width(&overlayStyle, 0);
+
+  lv_style_init(&modalStyle);
+  lv_style_set_bg_color(&modalStyle, lv_color_hex(0x141921));
+  lv_style_set_bg_opa(&modalStyle, LV_OPA_COVER);
+  lv_style_set_border_color(&modalStyle, kStroke);
+  lv_style_set_border_width(&modalStyle, 1);
+  lv_style_set_radius(&modalStyle, 6);
+  lv_style_set_pad_all(&modalStyle, 12);
+
+  lv_style_init(&buttonStyle);
+  lv_style_set_bg_color(&buttonStyle, lv_color_hex(0x232935));
+  lv_style_set_bg_opa(&buttonStyle, LV_OPA_COVER);
+  lv_style_set_border_color(&buttonStyle, kStroke);
+  lv_style_set_border_width(&buttonStyle, 1);
+  lv_style_set_radius(&buttonStyle, 4);
+
+  lv_style_init(&buttonAccentStyle);
+  lv_style_set_bg_color(&buttonAccentStyle, kAccentSoft);
+  lv_style_set_bg_opa(&buttonAccentStyle, LV_OPA_COVER);
+  lv_style_set_border_color(&buttonAccentStyle, kAccent);
+  lv_style_set_border_width(&buttonAccentStyle, 1);
+  lv_style_set_radius(&buttonAccentStyle, 4);
+
+  lv_style_init(&liveStyle);
+  lv_style_set_text_color(&liveStyle, kLive);
+  lv_style_set_text_font(&liveStyle, &lv_font_montserrat_12);
+
+  lv_style_init(&staleStyle);
+  lv_style_set_text_color(&staleStyle, kStale);
+  lv_style_set_text_font(&staleStyle, &lv_font_montserrat_12);
+
+  lv_style_init(&homeCardTopStyle);
+  lv_style_set_bg_color(&homeCardTopStyle, kPanel);
+  lv_style_set_bg_opa(&homeCardTopStyle, LV_OPA_COVER);
+  lv_style_set_border_width(&homeCardTopStyle, 0);
+  lv_style_set_radius(&homeCardTopStyle, 12);
+  lv_style_set_pad_left(&homeCardTopStyle, 10);
+  lv_style_set_pad_right(&homeCardTopStyle, 10);
+  lv_style_set_pad_top(&homeCardTopStyle, 6);
+  lv_style_set_pad_bottom(&homeCardTopStyle, 6);
+
+  lv_style_init(&homeCardBottomStyle);
+  lv_style_set_bg_color(&homeCardBottomStyle, kPanel);
+  lv_style_set_bg_opa(&homeCardBottomStyle, LV_OPA_COVER);
+  lv_style_set_border_width(&homeCardBottomStyle, 0);
+  lv_style_set_radius(&homeCardBottomStyle, 8);
+  lv_style_set_pad_left(&homeCardBottomStyle, 10);
+  lv_style_set_pad_right(&homeCardBottomStyle, 10);
+  lv_style_set_pad_top(&homeCardBottomStyle, 6);
+  lv_style_set_pad_bottom(&homeCardBottomStyle, 6);
 }
 
-void updateMenuButtons() {
-  if (menuAutoBtn == nullptr) return;
-  const lv_color_t activeBg = lv_color_hex(kAccentSoft);
-  const lv_color_t inactiveBg = lv_color_hex(0x101419);
-
-  lv_obj_set_style_bg_color(menuAutoBtn, !manualPageActive ? activeBg : inactiveBg, 0);
-  lv_obj_set_style_bg_color(menuSummaryBtn,
-                            manualPageActive && manualPageId == PageId::Summary ? activeBg : inactiveBg,
-                            0);
-  lv_obj_set_style_bg_color(menuTempsBtn,
-                            manualPageActive && manualPageId == PageId::Temps ? activeBg : inactiveBg, 0);
-  lv_obj_set_style_bg_color(menuDetailsBtn,
-                            manualPageActive && manualPageId == PageId::Details ? activeBg : inactiveBg,
-                            0);
-  if (menuBrightnessLowBtn != nullptr)
-    lv_obj_set_style_bg_color(menuBrightnessLowBtn, currentBrightnessPercent <= 35 ? activeBg : inactiveBg, 0);
-  if (menuBrightnessMidBtn != nullptr)
-    lv_obj_set_style_bg_color(menuBrightnessMidBtn,
-                              currentBrightnessPercent > 35 && currentBrightnessPercent < 85 ? activeBg
-                                                                                                : inactiveBg,
-                              0);
-  if (menuBrightnessMaxBtn != nullptr)
-    lv_obj_set_style_bg_color(menuBrightnessMaxBtn, currentBrightnessPercent >= 85 ? activeBg : inactiveBg, 0);
-  if (menuCalibrateBtn != nullptr) lv_obj_set_style_bg_color(menuCalibrateBtn, inactiveBg, 0);
+lv_obj_t *createText(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, const char *text,
+                     lv_style_t *style) {
+  lv_obj_t *label = lv_label_create(parent);
+  lv_obj_add_style(label, style, 0);
+  lv_label_set_text(label, text);
+  lv_obj_set_pos(label, x, y);
+  return label;
 }
 
-void buildSummaryPage() {
-  summaryPage = createPage();
+lv_obj_t *createImage(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, const lv_img_dsc_t *asset,
+                      lv_style_t *style = nullptr) {
+  lv_obj_t *img = lv_img_create(parent);
+  lv_img_set_src(img, asset);
+  lv_obj_set_pos(img, x, y);
+  if (style) lv_obj_add_style(img, style, 0);
+  return img;
+}
 
-  summaryStage = lv_label_create(summaryPage);
-  lv_obj_set_style_text_font(summaryStage, &lv_font_montserrat_18, 0);
-  lv_obj_set_style_text_color(summaryStage, lv_color_hex(0xF5F7FA), 0);
-  lv_obj_set_width(summaryStage, 220);
-  lv_label_set_long_mode(summaryStage, LV_LABEL_LONG_DOT);
-  lv_obj_set_pos(summaryStage, kPad, 8);
+lv_obj_t *createCardShell(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t w, lv_coord_t h,
+                          bool accent = false) {
+  lv_obj_t *card = lv_obj_create(parent);
+  lv_obj_remove_style_all(card);
+  lv_obj_add_style(card, accent ? &accentCardStyle : &cardStyle, 0);
+  lv_obj_set_pos(card, x, y);
+  lv_obj_set_size(card, w, h);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  return card;
+}
 
-  summaryPercent = lv_label_create(summaryPage);
-  lv_obj_add_style(summaryPercent, &heroStyle, 0);
-  lv_obj_align(summaryPercent, LV_ALIGN_TOP_RIGHT, -kPad, 6);
+lv_obj_t *createIconValueCard(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t w, lv_coord_t h,
+                              IconId icon, lv_obj_t **valueObj, const char *value, bool accent = false) {
+  lv_obj_t *card = createCardShell(parent, x, y, w, h, accent);
+  lv_obj_t *iconLabel = createText(card, 0, 0, iconText(icon), &tinyStyle);
+  lv_obj_set_style_text_color(iconLabel, kMuted, 0);
+  lv_obj_t *valueLabel = createText(card, 0, 18, value, &valueStyle);
+  lv_obj_set_width(valueLabel, w - 16);
+  lv_label_set_long_mode(valueLabel, LV_LABEL_LONG_DOT);
+  *valueObj = valueLabel;
+  return card;
+}
 
-  summaryJob = lv_label_create(summaryPage);
-  lv_obj_add_style(summaryJob, &subtleStyle, 0);
-  lv_obj_set_width(summaryJob, 296);
-  lv_label_set_long_mode(summaryJob, LV_LABEL_LONG_DOT);
-  lv_obj_set_pos(summaryJob, kPad, 34);
+lv_obj_t *createActionButton(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t w, lv_coord_t h,
+                             const char *text, lv_event_cb_t cb, bool accent = false) {
+  lv_obj_t *button = lv_obj_create(parent);
+  lv_obj_remove_style_all(button);
+  lv_obj_add_style(button, accent ? &buttonAccentStyle : &buttonStyle, 0);
+  lv_obj_set_pos(button, x, y);
+  lv_obj_set_size(button, w, h);
+  lv_obj_clear_flag(button, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(button, cb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t *label = lv_label_create(button);
+  lv_obj_add_style(label, &labelStyle, 0);
+  lv_obj_set_style_text_color(label, kText, 0);
+  lv_label_set_text(label, text);
+  lv_obj_center(label);
+  return button;
+}
 
-  summaryProgress = lv_bar_create(summaryPage);
-  lv_obj_set_size(summaryProgress, 296, 16);
-  lv_obj_set_pos(summaryProgress, kPad, 56);
-  lv_obj_set_style_bg_color(summaryProgress, lv_color_hex(0x202734), LV_PART_MAIN);
-  lv_obj_set_style_bg_color(summaryProgress, lv_color_hex(kAccentColor), LV_PART_INDICATOR);
-  lv_obj_set_style_radius(summaryProgress, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-  lv_obj_set_style_radius(summaryProgress, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
-  lv_bar_set_range(summaryProgress, 0, 100);
+lv_obj_t *createSystemInfoCard(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t w, lv_coord_t h,
+                               const char *title, const lv_img_dsc_t *iconAsset, lv_obj_t **valueObj,
+                               const char *value) {
+  lv_obj_t *card = lv_obj_create(parent);
+  lv_obj_remove_style_all(card);
+  lv_obj_add_style(card, &homeCardTopStyle, 0);
+  lv_obj_set_pos(card, x, y);
+  lv_obj_set_size(card, w, h);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
-  lv_obj_t *etaCard = createCard(summaryPage, 12, 90, 144, 72);
-  createCardTitle(etaCard, "Remaining");
-  summaryEta = createCardValue(etaCard, 24, &valueStyle, 128);
-  summaryDoneAt = createCardValue(etaCard, 46, &titleStyle, 128);
+  createText(card, 0, 0, title, &homeBodyStyle);
+  lv_obj_t *iconObj = createImage(card, w - 44, 0, iconAsset);
+  lv_img_set_zoom(iconObj, 149);
 
-  lv_obj_t *layerCard = createCard(summaryPage, 164, 90, 144, 72);
-  createCardTitle(layerCard, "Layers");
-  summaryLayers = createCardValue(layerCard, 24, &valueStyle, 128);
+  lv_obj_t *valueLabel = createText(card, 0, 20, value, &homeBodyStyle);
+  lv_obj_set_width(valueLabel, w - 20);
+  lv_label_set_long_mode(valueLabel, LV_LABEL_LONG_DOT);
+  *valueObj = valueLabel;
+  return card;
+}
 
-  static const char *timelineNames[4] = {"Heat", "Print", "Pause", "Done"};
-  for (int i = 0; i < 4; ++i) {
-    summaryTimeline[i] = lv_obj_create(summaryPage);
-    lv_obj_remove_style_all(summaryTimeline[i]);
-    lv_obj_add_style(summaryTimeline[i], &chipStyle, 0);
-    lv_obj_set_size(summaryTimeline[i], 56, 4);
-    lv_obj_set_pos(summaryTimeline[i], 12 + (i * 76), 180);
+lv_obj_t *createTinyStatCard(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t w, lv_coord_t h,
+                             const char *title, IconId icon, lv_obj_t **valueObj, const char *value) {
+  lv_obj_t *card = createCardShell(parent, x, y, w, h, false);
+  lv_obj_t *titleLabel = createText(card, 0, 0, title, &tinyStyle);
+  lv_obj_set_style_text_color(titleLabel, kText, 0);
+  lv_obj_t *iconLabel = createText(card, w - 30, 0, iconText(icon), &tinyStyle);
+  lv_obj_set_style_text_color(iconLabel, kText, 0);
+  lv_obj_t *valueLabel = createText(card, 0, 19, value, &tinyStyle);
+  lv_obj_set_width(valueLabel, w - 16);
+  lv_obj_set_style_text_color(valueLabel, kText, 0);
+  lv_label_set_long_mode(valueLabel, LV_LABEL_LONG_DOT);
+  *valueObj = valueLabel;
+  return card;
+}
 
-    summaryTimelineLabels[i] = lv_label_create(summaryPage);
-    lv_obj_add_style(summaryTimelineLabels[i], &titleStyle, 0);
-    lv_label_set_text(summaryTimelineLabels[i], timelineNames[i]);
-    lv_obj_set_pos(summaryTimelineLabels[i], 12 + (i * 76), 188);
+lv_obj_t *createHomeStatCard(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t w, lv_coord_t h,
+                             lv_style_t *style, const char *title, IconId icon, lv_obj_t **valueObj,
+                             const char *value) {
+  lv_obj_t *card = lv_obj_create(parent);
+  lv_obj_remove_style_all(card);
+  lv_obj_add_style(card, style, 0);
+  lv_obj_set_pos(card, x, y);
+  lv_obj_set_size(card, w, h);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *titleLabel = createText(card, 0, 0, title, &homeBodyStyle);
+  lv_obj_t *iconObj =
+      createImage(card, homeStatIconX(icon), homeStatIconY(icon), homeStatAsset(icon), &navIconImageStyle);
+  lv_img_set_zoom(iconObj, 149);
+  lv_obj_t *valueLabel = createText(card, 0, 19, value, &homeBodyStyle);
+  lv_obj_set_width(valueLabel, w - 20);
+  lv_label_set_long_mode(valueLabel, LV_LABEL_LONG_DOT);
+  *valueObj = valueLabel;
+  (void)titleLabel;
+  return card;
+}
+
+lv_obj_t *createPrintStatCard(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t w, const char *title,
+                              IconId icon, lv_obj_t **valueObj, const char *value) {
+  lv_obj_t *card = lv_obj_create(parent);
+  lv_obj_remove_style_all(card);
+  lv_obj_add_style(card, &homeCardTopStyle, 0);
+  lv_obj_set_pos(card, x, y);
+  lv_obj_set_size(card, w, 46);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+  createText(card, 0, 0, title, &homeBodyStyle);
+  lv_obj_t *iconObj = createImage(card, w - 44, 0, printStatAsset(icon));
+  lv_img_set_zoom(iconObj, 149);
+
+  lv_obj_t *valueLabel = createText(card, 0, 20, value, &homeBodyStyle);
+  lv_obj_set_width(valueLabel, w - 20);
+  lv_label_set_long_mode(valueLabel, LV_LABEL_LONG_DOT);
+  *valueObj = valueLabel;
+  return card;
+}
+
+void setLiveBadge(bool stale) {
+  if (!liveBadge) return;
+  lv_obj_remove_style_all(liveBadge);
+  lv_obj_add_style(liveBadge, stale ? &staleStyle : &liveStyle, 0);
+  lv_label_set_text(liveBadge, stale ? "OFFLINE" : "LIVE");
+}
+
+void showPage(Section section) {
+  activeSection = section;
+  lv_obj_add_flag(homePage, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(tempsPage, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(printPage, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(systemPage, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(menuPage, LV_OBJ_FLAG_HIDDEN);
+
+  switch (section) {
+    case Section::Home:
+      lv_obj_clear_flag(homePage, LV_OBJ_FLAG_HIDDEN);
+      break;
+    case Section::Temps:
+      lv_obj_clear_flag(tempsPage, LV_OBJ_FLAG_HIDDEN);
+      break;
+    case Section::Print:
+      lv_obj_clear_flag(printPage, LV_OBJ_FLAG_HIDDEN);
+      break;
+    case Section::System:
+      lv_obj_clear_flag(systemPage, LV_OBJ_FLAG_HIDDEN);
+      break;
+    case Section::Menu:
+      lv_obj_clear_flag(menuPage, LV_OBJ_FLAG_HIDDEN);
+      break;
+  }
+
+  for (uint8_t i = 0; i < 5; ++i) {
+    lv_obj_remove_style(navButtons[i], &navButtonActiveStyle, 0);
+    lv_obj_remove_style(navIcons[i], &navIconImageActiveStyle, 0);
+    lv_obj_add_style(navIcons[i], &navIconImageStyle, 0);
+    lv_obj_set_style_opa(navButtons[i], LV_OPA_COVER, 0);
+  }
+  const uint8_t idx = static_cast<uint8_t>(section);
+  lv_obj_add_style(navButtons[idx], &navButtonActiveStyle, 0);
+  lv_obj_remove_style(navIcons[idx], &navIconImageStyle, 0);
+  lv_obj_add_style(navIcons[idx], &navIconImageActiveStyle, 0);
+}
+
+void closeCalibrationConfirm() { lv_obj_add_flag(calibrationConfirmOverlay, LV_OBJ_FLAG_HIDDEN); }
+
+void showSystemPane(SystemPane pane) {
+  activeSystemPane = pane;
+  if (systemInfoPane) {
+    if (pane == SystemPane::Info) {
+      lv_obj_clear_flag(systemInfoPane, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(systemSettingsPane, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(systemInfoPane, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_clear_flag(systemSettingsPane, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  for (uint8_t i = 0; i < 2; ++i) {
+    lv_obj_remove_style(systemSubButtons[i], &subNavButtonActiveStyle, 0);
+    lv_obj_remove_style(systemSubIcons[i], &navIconImageActiveStyle, 0);
+    lv_obj_add_style(systemSubIcons[i], &navIconImageStyle, 0);
+  }
+  const uint8_t idx = static_cast<uint8_t>(pane);
+  lv_obj_add_style(systemSubButtons[idx], &subNavButtonActiveStyle, 0);
+  lv_obj_remove_style(systemSubIcons[idx], &navIconImageStyle, 0);
+  lv_obj_add_style(systemSubIcons[idx], &navIconImageActiveStyle, 0);
+}
+
+void openCalibrationConfirm() {
+  lv_obj_clear_flag(calibrationConfirmOverlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(calibrationConfirmOverlay);
+}
+
+void navEvent(lv_event_t *event) {
+  const intptr_t idx = reinterpret_cast<intptr_t>(lv_event_get_user_data(event));
+  closeCalibrationConfirm();
+  showPage(static_cast<Section>(idx));
+}
+
+void systemInfoPaneEvent(lv_event_t *) { showSystemPane(SystemPane::Info); }
+
+void systemSettingsPaneEvent(lv_event_t *) { showSystemPane(SystemPane::Settings); }
+
+void brightnessLowEvent(lv_event_t *) {
+  if (actionHandler) actionHandler(Action::SetBrightnessLow);
+}
+
+void brightnessMidEvent(lv_event_t *) {
+  if (actionHandler) actionHandler(Action::SetBrightnessMid);
+}
+
+void brightnessMaxEvent(lv_event_t *) {
+  if (actionHandler) actionHandler(Action::SetBrightnessMax);
+}
+
+void calibrateTouchEvent(lv_event_t *) { openCalibrationConfirm(); }
+
+void calibrationCancelEvent(lv_event_t *) { closeCalibrationConfirm(); }
+
+void calibrationStartEvent(lv_event_t *) {
+  closeCalibrationConfirm();
+  if (actionHandler) actionHandler(Action::StartTouchCalibration);
+}
+
+void menuPauseEvent(lv_event_t *) {
+  if (actionHandler) actionHandler(Action::PauseOrResumePrint);
+}
+
+void menuStopEvent(lv_event_t *) {
+  if (actionHandler) actionHandler(Action::StopPrint);
+}
+
+void menuSpeedSilentEvent(lv_event_t *) {
+  if (actionHandler) actionHandler(Action::SetSpeedSilent);
+}
+
+void menuSpeedStandardEvent(lv_event_t *) {
+  if (actionHandler) actionHandler(Action::SetSpeedStandard);
+}
+
+void menuSpeedSportEvent(lv_event_t *) {
+  if (actionHandler) actionHandler(Action::SetSpeedSport);
+}
+
+void menuSpeedLudicrousEvent(lv_event_t *) {
+  if (actionHandler) actionHandler(Action::SetSpeedLudicrous);
+}
+
+void initRail() {
+  rail = lv_obj_create(root);
+  lv_obj_remove_style_all(rail);
+  lv_obj_add_style(rail, &railStyle, 0);
+  lv_obj_set_pos(rail, -12, 0);
+  lv_obj_set_size(rail, kRailShellW, kScreenH);
+  lv_obj_clear_flag(rail, LV_OBJ_FLAG_SCROLLABLE);
+
+  for (uint8_t i = 0; i < 5; ++i) {
+    navButtons[i] = lv_obj_create(rail);
+    lv_obj_remove_style_all(navButtons[i]);
+    lv_obj_add_style(navButtons[i], &navButtonStyle, 0);
+    lv_obj_set_pos(navButtons[i], 12, i * 48);
+    lv_obj_set_size(navButtons[i], kRailW, 48);
+    lv_obj_clear_flag(navButtons[i], LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(navButtons[i], LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(navButtons[i], navEvent, LV_EVENT_CLICKED,
+                        reinterpret_cast<void *>(static_cast<intptr_t>(i)));
+
+    navIcons[i] = lv_img_create(navButtons[i]);
+    lv_obj_add_style(navIcons[i], &navIconImageStyle, 0);
+    lv_img_set_src(navIcons[i], railIconAsset(static_cast<Section>(i)));
+    lv_obj_center(navIcons[i]);
+  }
+
+  liveBadge = nullptr;
+}
+
+void initHomePage() {
+  homePage = lv_obj_create(root);
+  lv_obj_remove_style_all(homePage);
+  lv_obj_add_style(homePage, &pageStyle, 0);
+  lv_obj_set_pos(homePage, kContentX, 0);
+  lv_obj_set_size(homePage, kContentW, kScreenH);
+  lv_obj_clear_flag(homePage, LV_OBJ_FLAG_SCROLLABLE);
+
+  homeTitleLabel = createText(homePage, 10, 10, "Home", &homeTitleStyle);
+
+  homeInitLabel = createText(homePage, 52, 112, "BlPad is initializing...", &valueStyle);
+  lv_obj_add_flag(homeInitLabel, LV_OBJ_FLAG_HIDDEN);
+
+  homeProgressGroup = lv_obj_create(homePage);
+  lv_obj_remove_style_all(homeProgressGroup);
+  lv_obj_add_style(homeProgressGroup, &pageStyle, 0);
+  lv_obj_set_pos(homeProgressGroup, 10, 40);
+  lv_obj_set_size(homeProgressGroup, 252, 38);
+  lv_obj_clear_flag(homeProgressGroup, LV_OBJ_FLAG_SCROLLABLE);
+
+  homePercentLabel = createText(homeProgressGroup, 0, 0, "0%", &labelStyle);
+  lv_obj_set_style_text_color(homePercentLabel, kText, 0);
+
+  homeProgressBar = lv_bar_create(homeProgressGroup);
+  lv_obj_set_pos(homeProgressBar, 39, 1);
+  lv_obj_set_size(homeProgressBar, 213, 16);
+  lv_bar_set_range(homeProgressBar, 0, 100);
+  lv_obj_set_style_bg_color(homeProgressBar, kAccent, LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(homeProgressBar, 38, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(homeProgressBar, kAccent, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(homeProgressBar, LV_OPA_COVER, LV_PART_INDICATOR);
+  lv_obj_set_style_radius(homeProgressBar, 999, LV_PART_MAIN);
+  lv_obj_set_style_radius(homeProgressBar, 999, LV_PART_INDICATOR);
+  lv_obj_set_style_border_width(homeProgressBar, 0, 0);
+
+  homeJobLabel = createText(homeProgressGroup, 129, 21, "-", &labelStyle);
+  lv_obj_set_width(homeJobLabel, 123);
+  lv_label_set_long_mode(homeJobLabel, LV_LABEL_LONG_DOT);
+  lv_obj_set_style_text_color(homeJobLabel, kText, 0);
+
+  homeStatsGroup = lv_obj_create(homePage);
+  lv_obj_remove_style_all(homeStatsGroup);
+  lv_obj_add_style(homeStatsGroup, &pageStyle, 0);
+  lv_obj_set_pos(homeStatsGroup, 0, 0);
+  lv_obj_set_size(homeStatsGroup, kContentW, kScreenH);
+  lv_obj_clear_flag(homeStatsGroup, LV_OBJ_FLAG_SCROLLABLE);
+
+  createHomeStatCard(homeStatsGroup, 10, 101, 124, 46, &homeCardTopStyle, "Layer", IconId::Layers,
+                     &homeLayersValue, "38 / 100");
+  createHomeStatCard(homeStatsGroup, 138, 101, 124, 46, &homeCardTopStyle, "Time", IconId::Print,
+                     &homeTimeValue, "2h 21m");
+  createHomeStatCard(homeStatsGroup, 10, 151, 124, 46, &homeCardBottomStyle, "Bed", IconId::Bed,
+                     &homeBedValue, "69 / 70 C");
+  createHomeStatCard(homeStatsGroup, 138, 151, 124, 46, &homeCardBottomStyle, "Nozzle", IconId::Nozzle,
+                     &homeNozzleValue, "129 / 130 C");
+
+  const char *controlLabels[4] = {"Pause", "Heat", "Print", "Finish"};
+  homeControlsGroup = lv_obj_create(homePage);
+  lv_obj_remove_style_all(homeControlsGroup);
+  lv_obj_add_style(homeControlsGroup, &pageStyle, 0);
+  lv_obj_set_pos(homeControlsGroup, 0, 0);
+  lv_obj_set_size(homeControlsGroup, kContentW, kScreenH);
+  lv_obj_clear_flag(homeControlsGroup, LV_OBJ_FLAG_SCROLLABLE);
+  for (uint8_t i = 0; i < 4; ++i) {
+    const lv_coord_t x = 10 + (i * 65) + (i == 3 ? 1 : 0);
+    homeControlBars[i] = lv_obj_create(homeControlsGroup);
+    lv_obj_remove_style_all(homeControlBars[i]);
+    lv_obj_set_pos(homeControlBars[i], x, 207);
+    lv_obj_set_size(homeControlBars[i], 56, 4);
+    lv_obj_set_style_radius(homeControlBars[i], 999, 0);
+    lv_obj_set_style_bg_color(homeControlBars[i], kAccent, 0);
+    lv_obj_set_style_bg_opa(homeControlBars[i], LV_OPA_50, 0);
+    createText(homeControlsGroup, x, 215, controlLabels[i], &homeControlTextStyle);
   }
 }
 
-void buildHeatingPage() {
-  heatingPage = createPage();
+void initTempsPage() {
+  tempsPage = lv_obj_create(root);
+  lv_obj_remove_style_all(tempsPage);
+  lv_obj_add_style(tempsPage, &pageStyle, 0);
+  lv_obj_set_pos(tempsPage, kContentX, 0);
+  lv_obj_set_size(tempsPage, kContentW, kScreenH);
+  lv_obj_clear_flag(tempsPage, LV_OBJ_FLAG_SCROLLABLE);
 
-  heatingTitle = lv_label_create(heatingPage);
-  lv_obj_add_style(heatingTitle, &heroStyle, 0);
-  lv_obj_set_pos(heatingTitle, kPad, 18);
-  lv_label_set_text(heatingTitle, "Heating");
+  createText(tempsPage, 10, 10, "Temperature", &homeTitleStyle);
 
-  heatingSubtitle = lv_label_create(heatingPage);
-  lv_obj_set_style_text_font(heatingSubtitle, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(heatingSubtitle, lv_color_hex(0xD8DEE7), 0);
-  lv_obj_set_width(heatingSubtitle, 296);
-  lv_label_set_long_mode(heatingSubtitle, LV_LABEL_LONG_DOT);
-  lv_obj_set_pos(heatingSubtitle, kPad, 54);
+  lv_obj_t *chartWrap = lv_obj_create(tempsPage);
+  lv_obj_remove_style_all(chartWrap);
+  lv_obj_set_pos(chartWrap, 10, 40);
+  lv_obj_set_size(chartWrap, 252, 134);
+  lv_obj_set_style_bg_opa(chartWrap, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(chartWrap, 0, 0);
+  lv_obj_set_style_radius(chartWrap, 0, 0);
+  lv_obj_clear_flag(chartWrap, LV_OBJ_FLAG_SCROLLABLE);
 
-  lv_obj_t *nozzleCard = createCard(heatingPage, 12, 100, 144, 72);
-  createCardTitle(nozzleCard, "Nozzle");
-  heatingNozzle = createCardValue(nozzleCard, 26, &valueStyle, 128);
+  tempsChart = lv_chart_create(chartWrap);
+  lv_obj_set_size(tempsChart, 252, 134);
+  lv_obj_set_pos(tempsChart, 0, 0);
+  lv_obj_set_style_bg_opa(tempsChart, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(tempsChart, 0, 0);
+  lv_obj_set_style_pad_all(tempsChart, 0, 0);
+  lv_obj_set_style_pad_gap(tempsChart, 0, 0);
+  lv_obj_set_style_line_color(tempsChart, lv_color_hex(0x4B3A47), LV_PART_MAIN);
+  lv_obj_set_style_line_width(tempsChart, 1, LV_PART_MAIN);
+  lv_obj_set_style_size(tempsChart, 4, LV_PART_INDICATOR);
+  lv_obj_set_style_line_width(tempsChart, 2, LV_PART_ITEMS);
+  lv_obj_set_style_bg_opa(tempsChart, LV_OPA_COVER, LV_PART_INDICATOR);
+  lv_obj_set_style_radius(tempsChart, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+  lv_obj_set_style_border_color(tempsChart, lv_color_hex(0x4B3A47), 0);
+  lv_obj_set_style_border_width(tempsChart, 1, 0);
+  lv_obj_set_style_border_side(tempsChart, LV_BORDER_SIDE_RIGHT | LV_BORDER_SIDE_BOTTOM, 0);
+  lv_chart_set_type(tempsChart, LV_CHART_TYPE_LINE);
+  lv_chart_set_range(tempsChart, LV_CHART_AXIS_PRIMARY_Y, 0, 260);
+  lv_chart_set_point_count(tempsChart, kTempHistorySize);
+  lv_chart_set_div_line_count(tempsChart, 4, 4);
+  tempsNozzleSeries = lv_chart_add_series(tempsChart, kAccent, LV_CHART_AXIS_PRIMARY_Y);
+  tempsBedSeries = lv_chart_add_series(tempsChart, kLineBed, LV_CHART_AXIS_PRIMARY_Y);
 
-  lv_obj_t *bedCard = createCard(heatingPage, 164, 100, 144, 72);
-  createCardTitle(bedCard, "Bed");
-  heatingBed = createCardValue(bedCard, 26, &valueStyle, 128);
+  createHomeStatCard(tempsPage, 10, 184, 124, 46, &homeCardBottomStyle, "Bed", IconId::Bed,
+                     &tempsBedValue, "69 / 70 C");
+  createHomeStatCard(tempsPage, 138, 184, 124, 46, &homeCardBottomStyle, "Nozzle", IconId::Nozzle,
+                     &tempsNozzleValue, "129 / 130 C");
 }
 
-void buildTempsPage() {
-  tempsPage = createPage();
+void initPrintPage() {
+  printPage = lv_obj_create(root);
+  lv_obj_remove_style_all(printPage);
+  lv_obj_add_style(printPage, &pageStyle, 0);
+  lv_obj_set_pos(printPage, kContentX, 0);
+  lv_obj_set_size(printPage, kContentW, kScreenH);
+  lv_obj_clear_flag(printPage, LV_OBJ_FLAG_SCROLLABLE);
 
-  lv_obj_t *title = lv_label_create(tempsPage);
-  lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
-  lv_obj_set_style_text_color(title, lv_color_hex(0xF5F7FA), 0);
-  lv_label_set_text(title, "Temperatures");
-  lv_obj_set_pos(title, kPad, 8);
+  createText(printPage, 10, 10, "Print", &homeTitleStyle);
 
-  tempChart = lv_chart_create(tempsPage);
-  lv_obj_set_size(tempChart, 206, 120);
-  lv_obj_set_pos(tempChart, 12, 36);
-  lv_obj_set_style_bg_opa(tempChart, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(tempChart, 0, 0);
-  lv_obj_set_style_line_color(tempChart, lv_color_hex(0x312838), LV_PART_MAIN);
-  lv_obj_set_style_line_opa(tempChart, LV_OPA_40, LV_PART_MAIN);
-  lv_chart_set_type(tempChart, LV_CHART_TYPE_LINE);
-  lv_chart_set_point_count(tempChart, 20);
-  lv_chart_set_range(tempChart, LV_CHART_AXIS_PRIMARY_Y, 0, 260);
-  lv_chart_set_div_line_count(tempChart, 2, 4);
-  tempNozzleSeries = lv_chart_add_series(tempChart, lv_color_hex(kAccentColor), LV_CHART_AXIS_PRIMARY_Y);
-  tempBedSeries = lv_chart_add_series(tempChart, lv_color_hex(0x7DD3FC), LV_CHART_AXIS_PRIMARY_Y);
-  lv_chart_set_ext_y_array(tempChart, tempNozzleSeries, nozzleHistory);
-  lv_chart_set_ext_y_array(tempChart, tempBedSeries, bedHistory);
+  lv_obj_t *jobCard = lv_obj_create(printPage);
+  lv_obj_remove_style_all(jobCard);
+  lv_obj_add_style(jobCard, &homeCardTopStyle, 0);
+  lv_obj_set_pos(jobCard, 10, 40);
+  lv_obj_set_size(jobCard, 252, 50);
+  lv_obj_clear_flag(jobCard, LV_OBJ_FLAG_SCROLLABLE);
 
-  tempLegendNozzle = lv_label_create(tempsPage);
-  lv_obj_add_style(tempLegendNozzle, &titleStyle, 0);
-  lv_label_set_text(tempLegendNozzle, "Pink: Nozzle");
-  lv_obj_set_pos(tempLegendNozzle, 12, 164);
+  createText(jobCard, 0, 0, "Task name", &labelStyle);
+  lv_obj_t *taskIcon = createImage(jobCard, 208, 0, &ui_icon_file_list);
+  lv_img_set_zoom(taskIcon, 149);
 
-  tempLegendBed = lv_label_create(tempsPage);
-  lv_obj_add_style(tempLegendBed, &titleStyle, 0);
-  lv_label_set_text(tempLegendBed, "Blue: Bed");
-  lv_obj_set_pos(tempLegendBed, 110, 164);
+  printJobLabel = createText(jobCard, 0, 20, "-", &labelStyle);
+  lv_obj_set_width(printJobLabel, 172);
+  lv_label_set_long_mode(printJobLabel, LV_LABEL_LONG_DOT);
 
-  lv_obj_t *nozzleCard = createCard(tempsPage, 226, 36, 82, 62);
-  createCardTitle(nozzleCard, "Nozzle");
-  tempNozzle = createCardValue(nozzleCard, 26, &valueStyle, 66);
+  printProgressValue = createText(jobCard, 190, 20, "0%", &labelStyle);
 
-  lv_obj_t *bedCard = createCard(tempsPage, 226, 106, 82, 62);
-  createCardTitle(bedCard, "Bed");
-  tempBed = createCardValue(bedCard, 26, &valueStyle, 66);
+  createPrintStatCard(printPage, 10, 94, 124, "Remaining", IconId::Print, &printRemainValue, "--");
+  createPrintStatCard(printPage, 138, 94, 124, "Layer", IconId::Layers, &printLayersValue, "0 / 0");
+  createPrintStatCard(printPage, 10, 144, 124, "Speed", IconId::Speed, &printSpeedValue, "Normal");
+  createPrintStatCard(printPage, 138, 144, 124, "State", IconId::System, &printStateValue, "Ready");
 }
 
-void buildDetailsPage() {
-  detailsPage = createPage();
+void initSystemPage() {
+  systemPage = lv_obj_create(root);
+  lv_obj_remove_style_all(systemPage);
+  lv_obj_add_style(systemPage, &pageStyle, 0);
+  lv_obj_set_pos(systemPage, kContentX, 0);
+  lv_obj_set_size(systemPage, kContentW, kScreenH);
+  lv_obj_clear_flag(systemPage, LV_OBJ_FLAG_SCROLLABLE);
 
-  lv_obj_t *title = lv_label_create(detailsPage);
-  lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
-  lv_obj_set_style_text_color(title, lv_color_hex(0xF5F7FA), 0);
-  lv_label_set_text(title, "Details");
-  lv_obj_set_pos(title, kPad, 8);
+  lv_obj_t *contentWrap = lv_obj_create(systemPage);
+  lv_obj_remove_style_all(contentWrap);
+  lv_obj_add_style(contentWrap, &pageStyle, 0);
+  lv_obj_set_pos(contentWrap, 0, 0);
+  lv_obj_set_size(contentWrap, 240, kScreenH);
+  lv_obj_clear_flag(contentWrap, LV_OBJ_FLAG_SCROLLABLE);
 
-  lv_obj_t *stateCard = createCard(detailsPage, 12, 36, 144, 48);
-  createCardTitle(stateCard, "State");
-  detailState = createCardValue(stateCard, 22, &compactValueStyle, 128);
+  systemInfoPane = lv_obj_create(contentWrap);
+  lv_obj_remove_style_all(systemInfoPane);
+  lv_obj_add_style(systemInfoPane, &pageStyle, 0);
+  lv_obj_set_size(systemInfoPane, 240, kScreenH);
+  lv_obj_set_pos(systemInfoPane, 0, 0);
+  lv_obj_clear_flag(systemInfoPane, LV_OBJ_FLAG_SCROLLABLE);
 
-  lv_obj_t *wifiCard = createCard(detailsPage, 164, 36, 144, 48);
-  createCardTitle(wifiCard, "WiFi");
-  detailWifi = createCardValue(wifiCard, 22, &compactValueStyle, 128);
+  createText(systemInfoPane, 10, 10, "System", &homeTitleStyle);
+  createSystemInfoCard(systemInfoPane, 10, 40, 108, 46, "Wifi", &ui_icon_wifi_fill, &systemWifiValue, "-49 dBm");
+  createSystemInfoCard(systemInfoPane, 122, 40, 108, 46, "Status", &ui_icon_wifi_fill, &systemMqttValue,
+                       "Connected");
+  createSystemInfoCard(systemInfoPane, 10, 90, 108, 46, "RAM", &ui_icon_sdcard, &systemRamValue, "35%");
+  createSystemInfoCard(systemInfoPane, 122, 90, 108, 46, "Flash", &ui_icon_sdcard, &systemFlashValue, "40%");
 
-  lv_obj_t *jobCard = createCard(detailsPage, 12, 92, 296, 52);
-  createCardTitle(jobCard, "Job");
-  detailJob = createCardValue(jobCard, 22, &compactValueStyle, 280);
+  lv_obj_t *foot = lv_obj_create(systemInfoPane);
+  lv_obj_remove_style_all(foot);
+  lv_obj_add_style(foot, &homeCardTopStyle, 0);
+  lv_obj_set_pos(foot, 10, 140);
+  lv_obj_set_size(foot, 220, 50);
+  lv_obj_clear_flag(foot, LV_OBJ_FLAG_SCROLLABLE);
+  systemTypeValue = createText(foot, 0, 0, "Type idle", &homeBodyStyle);
+  lv_obj_t *serverIcon = createImage(foot, 176, 0, &ui_icon_server);
+  lv_img_set_zoom(serverIcon, 149);
+  systemCommandValue = createText(foot, 0, 20, "Cmd push_status", &homeBodyStyle);
 
-  lv_obj_t *typeCard = createCard(detailsPage, 12, 152, 144, 56);
-  createCardTitle(typeCard, "Type");
-  detailType = createCardValue(typeCard, 22, &compactValueStyle, 128);
+  systemSettingsPane = lv_obj_create(contentWrap);
+  lv_obj_remove_style_all(systemSettingsPane);
+  lv_obj_add_style(systemSettingsPane, &pageStyle, 0);
+  lv_obj_set_size(systemSettingsPane, 240, kScreenH);
+  lv_obj_set_pos(systemSettingsPane, 0, 0);
+  lv_obj_clear_flag(systemSettingsPane, LV_OBJ_FLAG_SCROLLABLE);
 
-  lv_obj_t *speedCard = createCard(detailsPage, 164, 152, 144, 56);
-  createCardTitle(speedCard, "Speed");
-  detailSpeed = createCardValue(speedCard, 22, &compactValueStyle, 128);
+  createText(systemSettingsPane, 10, 10, "System", &homeTitleStyle);
+  createText(systemSettingsPane, 10, 40, "Brightness", &homeBodyStyle);
+  const char *brightnessLabels[3] = {"Low", "Mid", "Max"};
+  const lv_coord_t brightnessX[3] = {10, 85, 160};
+  const lv_coord_t brightnessW[3] = {71, 71, 70};
+  for (uint8_t i = 0; i < 3; ++i) {
+    systemBrightnessButtons[i] = lv_obj_create(systemSettingsPane);
+    lv_obj_remove_style_all(systemBrightnessButtons[i]);
+    lv_obj_set_pos(systemBrightnessButtons[i], brightnessX[i], 58);
+    lv_obj_set_size(systemBrightnessButtons[i], brightnessW[i], 28);
+    lv_obj_set_style_radius(systemBrightnessButtons[i], 12, 0);
+    lv_obj_set_style_border_width(systemBrightnessButtons[i], 0, 0);
+    lv_obj_clear_flag(systemBrightnessButtons[i], LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(systemBrightnessButtons[i], LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *label = createText(systemBrightnessButtons[i], 0, 0, brightnessLabels[i], &homeBodyStyle);
+    lv_obj_center(label);
+  }
+  lv_obj_add_event_cb(systemBrightnessButtons[0], brightnessLowEvent, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(systemBrightnessButtons[1], brightnessMidEvent, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(systemBrightnessButtons[2], brightnessMaxEvent, LV_EVENT_CLICKED, nullptr);
+
+  createText(systemSettingsPane, 10, 98, "Touch", &homeBodyStyle);
+  lv_obj_t *touchButton = lv_obj_create(systemSettingsPane);
+  lv_obj_remove_style_all(touchButton);
+  lv_obj_set_pos(touchButton, 10, 116);
+  lv_obj_set_size(touchButton, 220, 28);
+  lv_obj_set_style_radius(touchButton, 12, 0);
+  lv_obj_set_style_border_width(touchButton, 0, 0);
+  lv_obj_set_style_bg_color(touchButton, kAccent, 0);
+  lv_obj_set_style_bg_opa(touchButton, LV_OPA_50, 0);
+  lv_obj_clear_flag(touchButton, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(touchButton, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(touchButton, calibrateTouchEvent, LV_EVENT_CLICKED, nullptr);
+  systemTouchValue = createText(touchButton, 0, 0, "Calibrate Touch", &homeBodyStyle);
+  lv_obj_center(systemTouchValue);
+
+  lv_obj_t *rightRail = lv_obj_create(systemPage);
+  lv_obj_remove_style_all(rightRail);
+  lv_obj_add_style(rightRail, &railStyle, 0);
+  lv_obj_set_pos(rightRail, 240, 0);
+  lv_obj_set_size(rightRail, 32, kScreenH);
+  lv_obj_set_style_radius(rightRail, 0, 0);
+  lv_obj_set_style_bg_color(rightRail, kRail, 0);
+  lv_obj_set_style_bg_opa(rightRail, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(rightRail, 0, 0);
+  lv_obj_set_style_radius(rightRail, 12, 0);
+  lv_obj_clear_flag(rightRail, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *topRightFill = lv_obj_create(rightRail);
+  lv_obj_remove_style_all(topRightFill);
+  lv_obj_set_pos(topRightFill, 20, 0);
+  lv_obj_set_size(topRightFill, 12, 12);
+  lv_obj_set_style_bg_color(topRightFill, kRail, 0);
+  lv_obj_set_style_bg_opa(topRightFill, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(topRightFill, 0, 0);
+  lv_obj_clear_flag(topRightFill, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *bottomRightFill = lv_obj_create(rightRail);
+  lv_obj_remove_style_all(bottomRightFill);
+  lv_obj_set_pos(bottomRightFill, 20, kScreenH - 12);
+  lv_obj_set_size(bottomRightFill, 12, 12);
+  lv_obj_set_style_bg_color(bottomRightFill, kRail, 0);
+  lv_obj_set_style_bg_opa(bottomRightFill, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(bottomRightFill, 0, 0);
+  lv_obj_clear_flag(bottomRightFill, LV_OBJ_FLAG_SCROLLABLE);
+
+  for (uint8_t i = 0; i < 2; ++i) {
+    systemSubButtons[i] = lv_obj_create(rightRail);
+    lv_obj_remove_style_all(systemSubButtons[i]);
+    lv_obj_add_style(systemSubButtons[i], &navButtonStyle, 0);
+    lv_obj_set_pos(systemSubButtons[i], 0, i * 120);
+    lv_obj_set_size(systemSubButtons[i], 32, 120);
+    lv_obj_clear_flag(systemSubButtons[i], LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(systemSubButtons[i], LV_OBJ_FLAG_CLICKABLE);
+  }
+  lv_obj_add_event_cb(systemSubButtons[0], systemInfoPaneEvent, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(systemSubButtons[1], systemSettingsPaneEvent, LV_EVENT_CLICKED, nullptr);
+
+  systemSubIcons[0] = lv_img_create(systemSubButtons[0]);
+  lv_obj_add_style(systemSubIcons[0], &navIconImageStyle, 0);
+  lv_img_set_src(systemSubIcons[0], &ui_icon_info);
+  lv_img_set_zoom(systemSubIcons[0], 171);
+  lv_obj_center(systemSubIcons[0]);
+
+  systemSubIcons[1] = lv_img_create(systemSubButtons[1]);
+  lv_obj_add_style(systemSubIcons[1], &navIconImageStyle, 0);
+  lv_img_set_src(systemSubIcons[1], &ui_icon_system);
+  lv_img_set_zoom(systemSubIcons[1], 171);
+  lv_obj_center(systemSubIcons[1]);
+
+  showSystemPane(SystemPane::Info);
 }
 
-void buildIdlePage() {
-  idlePage = createPage();
+void initMenuPage() {
+  menuPage = lv_obj_create(root);
+  lv_obj_remove_style_all(menuPage);
+  lv_obj_add_style(menuPage, &pageStyle, 0);
+  lv_obj_set_pos(menuPage, kContentX, 0);
+  lv_obj_set_size(menuPage, kContentW, kScreenH);
+  lv_obj_clear_flag(menuPage, LV_OBJ_FLAG_SCROLLABLE);
 
-  idleStatus = lv_label_create(idlePage);
-  lv_obj_add_style(idleStatus, &heroStyle, 0);
-  lv_obj_set_pos(idleStatus, 12, 18);
-  lv_label_set_text(idleStatus, "Ready");
+  createText(menuPage, 10, 10, "Menu", &homeTitleStyle);
 
-  idleJob = lv_label_create(idlePage);
-  lv_obj_set_style_text_font(idleJob, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(idleJob, lv_color_hex(0xC8D0DA), 0);
-  lv_obj_set_width(idleJob, 296);
-  lv_label_set_long_mode(idleJob, LV_LABEL_LONG_DOT);
-  lv_obj_set_pos(idleJob, 12, 54);
+  createText(menuPage, 10, 40, "Print", &homeBodyStyle);
+  menuPauseButton = lv_obj_create(menuPage);
+  lv_obj_remove_style_all(menuPauseButton);
+  lv_obj_set_pos(menuPauseButton, 10, 58);
+  lv_obj_set_size(menuPauseButton, 123, 28);
+  lv_obj_set_style_radius(menuPauseButton, 12, 0);
+  lv_obj_set_style_border_width(menuPauseButton, 0, 0);
+  lv_obj_set_style_bg_color(menuPauseButton, kAccent, 0);
+  lv_obj_set_style_bg_opa(menuPauseButton, 38, 0);
+  lv_obj_clear_flag(menuPauseButton, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(menuPauseButton, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(menuPauseButton, menuPauseEvent, LV_EVENT_CLICKED, nullptr);
+  menuPauseLabel = createText(menuPauseButton, 0, 0, "Pause", &homeBodyStyle);
+  lv_obj_center(menuPauseLabel);
 
-  lv_obj_t *tempCard = createCard(idlePage, 12, 112, 296, 54);
-  createCardTitle(tempCard, "Temperatures");
-  idleTemp = createCardValue(tempCard, 22, &valueStyle, 280);
+  menuStopButton = lv_obj_create(menuPage);
+  lv_obj_remove_style_all(menuStopButton);
+  lv_obj_set_pos(menuStopButton, 139, 58);
+  lv_obj_set_size(menuStopButton, 123, 28);
+  lv_obj_set_style_radius(menuStopButton, 12, 0);
+  lv_obj_set_style_border_width(menuStopButton, 0, 0);
+  lv_obj_set_style_bg_color(menuStopButton, kAccent, 0);
+  lv_obj_set_style_bg_opa(menuStopButton, 38, 0);
+  lv_obj_clear_flag(menuStopButton, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(menuStopButton, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(menuStopButton, menuStopEvent, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t *stopLabel = createText(menuStopButton, 0, 0, "Stop", &homeBodyStyle);
+  lv_obj_center(stopLabel);
+
+  createText(menuPage, 10, 98, "Speed", &homeBodyStyle);
+  const char *speedLabels[4] = {"Sil.", "Stan.", "Sport", "Ludi."};
+  const lv_coord_t speedX[4] = {10, 74, 138, 202};
+  const lv_coord_t speedW[4] = {59, 59, 59, 60};
+  lv_event_cb_t speedEvents[4] = {menuSpeedSilentEvent, menuSpeedStandardEvent, menuSpeedSportEvent,
+                                  menuSpeedLudicrousEvent};
+  for (uint8_t i = 0; i < 4; ++i) {
+    menuSpeedButtons[i] = lv_obj_create(menuPage);
+    lv_obj_remove_style_all(menuSpeedButtons[i]);
+    lv_obj_set_pos(menuSpeedButtons[i], speedX[i], 116);
+    lv_obj_set_size(menuSpeedButtons[i], speedW[i], 28);
+    lv_obj_set_style_radius(menuSpeedButtons[i], 12, 0);
+    lv_obj_set_style_border_width(menuSpeedButtons[i], 0, 0);
+    lv_obj_set_style_bg_color(menuSpeedButtons[i], kAccent, 0);
+    lv_obj_set_style_bg_opa(menuSpeedButtons[i], 38, 0);
+    lv_obj_clear_flag(menuSpeedButtons[i], LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(menuSpeedButtons[i], LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(menuSpeedButtons[i], speedEvents[i], LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *label = createText(menuSpeedButtons[i], 0, 0, speedLabels[i], &homeBodyStyle);
+    lv_obj_center(label);
+  }
 }
 
-void buildFinishPage() {
-  finishPage = createPage();
+void initCalibrationConfirm() {
+  calibrationConfirmOverlay = lv_obj_create(root);
+  lv_obj_remove_style_all(calibrationConfirmOverlay);
+  lv_obj_add_style(calibrationConfirmOverlay, &overlayStyle, 0);
+  lv_obj_set_size(calibrationConfirmOverlay, kScreenW, kScreenH);
+  lv_obj_clear_flag(calibrationConfirmOverlay, LV_OBJ_FLAG_SCROLLABLE);
 
-  finishTitle = lv_label_create(finishPage);
-  lv_obj_add_style(finishTitle, &heroStyle, 0);
-  lv_obj_set_pos(finishTitle, 12, 18);
-  lv_label_set_text(finishTitle, "Print Finished");
+  lv_obj_t *panel = createCardShell(calibrationConfirmOverlay, 54, 58, 212, 116, false);
+  lv_obj_add_style(panel, &modalStyle, 0);
+  createText(panel, 0, 0, "Start calibration?", &valueStyle);
+  createText(panel, 0, 28, "Current touch mapping will be replaced.", &tinyStyle);
+  createActionButton(panel, 0, 70, 84, 28, "Cancel", calibrationCancelEvent);
+  createActionButton(panel, 96, 70, 92, 28, "Start", calibrationStartEvent, true);
 
-  finishJob = lv_label_create(finishPage);
-  lv_obj_set_style_text_font(finishJob, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(finishJob, lv_color_hex(0xD8DEE7), 0);
-  lv_obj_set_width(finishJob, 296);
-  lv_label_set_long_mode(finishJob, LV_LABEL_LONG_DOT);
-  lv_obj_set_pos(finishJob, 12, 54);
-
-  lv_obj_t *layersCard = createCard(finishPage, 12, 112, 144, 60);
-  createCardTitle(layersCard, "Layers");
-  finishLayers = createCardValue(layersCard, 24, &valueStyle, 128);
-
-  lv_obj_t *typeCard = createCard(finishPage, 164, 112, 144, 60);
-  createCardTitle(typeCard, "Type");
-  finishType = createCardValue(typeCard, 24, &compactValueStyle, 128);
+  lv_obj_add_flag(calibrationConfirmOverlay, LV_OBJ_FLAG_HIDDEN);
 }
 
-void buildNoticePage() {
-  noticePage = createPage();
+void initCalibrationOverlay() {
+  calibrationOverlay = lv_obj_create(root);
+  lv_obj_remove_style_all(calibrationOverlay);
+  lv_obj_add_style(calibrationOverlay, &overlayStyle, 0);
+  lv_obj_set_size(calibrationOverlay, kScreenW, kScreenH);
+  lv_obj_clear_flag(calibrationOverlay, LV_OBJ_FLAG_SCROLLABLE);
 
-  noticeTitle = lv_label_create(noticePage);
-  lv_obj_add_style(noticeTitle, &heroStyle, 0);
-  lv_obj_set_width(noticeTitle, 296);
-  lv_obj_set_pos(noticeTitle, 12, 20);
+  createText(calibrationOverlay, 72, 24, "Tap highlighted point", &valueStyle);
+  calibrationStepLabel = createText(calibrationOverlay, 72, 48, "1 / 4", &tinyStyle);
 
-  noticeSubtitle = lv_label_create(noticePage);
-  lv_obj_set_style_text_font(noticeSubtitle, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(noticeSubtitle, lv_color_hex(0xD8DEE7), 0);
-  lv_obj_set_width(noticeSubtitle, 296);
-  lv_label_set_long_mode(noticeSubtitle, LV_LABEL_LONG_WRAP);
-  lv_obj_set_pos(noticeSubtitle, 12, 56);
+  calibrationCross = lv_obj_create(calibrationOverlay);
+  lv_obj_remove_style_all(calibrationCross);
+  lv_obj_set_size(calibrationCross, 18, 18);
+  lv_obj_set_style_bg_opa(calibrationCross, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(calibrationCross, 0, 0);
 
-  lv_obj_t *metaA = createCard(noticePage, 12, 146, 296, 56);
-  createCardTitle(metaA, "Status");
-  noticeMetaA = createCardValue(metaA, 22, &compactValueStyle, 280);
+  lv_obj_t *h = lv_obj_create(calibrationCross);
+  lv_obj_remove_style_all(h);
+  lv_obj_set_size(h, 18, 2);
+  lv_obj_center(h);
+  lv_obj_set_style_bg_color(h, kAccent, 0);
+  lv_obj_set_style_bg_opa(h, LV_OPA_COVER, 0);
+
+  lv_obj_t *v = lv_obj_create(calibrationCross);
+  lv_obj_remove_style_all(v);
+  lv_obj_set_size(v, 2, 18);
+  lv_obj_center(v);
+  lv_obj_set_style_bg_color(v, kAccent, 0);
+  lv_obj_set_style_bg_opa(v, LV_OPA_COVER, 0);
+
+  lv_obj_add_flag(calibrationOverlay, LV_OBJ_FLAG_HIDDEN);
 }
 
-void updateNoticePage(const PrinterState &state) {
-  char prettyState[48];
-  char layersText[32];
-  char timeText[32];
-  formatDisplayText(effectiveStage(state), prettyState, sizeof(prettyState));
-  snprintf(layersText, sizeof(layersText), "%d/%d", state.currentLayer, state.totalLayers);
-  formatDuration(state.remainingMinutes, timeText, sizeof(timeText));
+void refreshHome() {
+  char buffer[24];
+  const bool initializing = !currentState.hasData;
+  const bool printerOffline = currentState.hasData && currentState.stale;
 
-  switch (currentMode) {
-    case ViewMode::Offline:
-      setLabelText(noticeTitle, "Printer Offline");
-      setLabelText(noticeSubtitle, "No fresh LAN/MQTT data. Waiting for the printer to respond.");
-      setLabelText(noticeMetaA, "Stale");
-      break;
-    case ViewMode::Paused:
-      setLabelText(noticeTitle, "Print Paused");
-      setLabelText(noticeSubtitle, state.jobName);
-      setLabelText(noticeMetaA, layersText);
-      break;
-    case ViewMode::Finished:
-      setLabelText(noticeTitle, "Print Finished");
-      setLabelText(noticeSubtitle, state.jobName);
-      setLabelText(noticeMetaA, layersText);
-      break;
-    case ViewMode::Heating:
-    case ViewMode::Printing:
-    case ViewMode::Idle:
-      setLabelText(noticeTitle, prettyState);
-      setLabelText(noticeSubtitle, state.jobName);
-      setLabelText(noticeMetaA, timeText);
-      break;
+  if (initializing) {
+    lv_label_set_text(homeTitleLabel, "");
+    lv_obj_add_flag(homeProgressGroup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(homeStatsGroup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(homeControlsGroup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(homeInitLabel, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_clear_flag(homeProgressGroup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(homeStatsGroup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(homeControlsGroup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(homeInitLabel, LV_OBJ_FLAG_HIDDEN);
+
+    if (printerOffline) {
+      lv_label_set_text(homeTitleLabel, "Printer Offline");
+      lv_label_set_text(homePercentLabel, "??%");
+      lv_bar_set_value(homeProgressBar, 0, LV_ANIM_OFF);
+      lv_label_set_text(homeJobLabel, "...");
+      lv_label_set_text(homeTimeValue, "...");
+      lv_label_set_text(homeLayersValue, "... / ...");
+      lv_label_set_text(homeBedValue, "... / ... °C");
+      lv_label_set_text(homeNozzleValue, "... / ... °C");
+    } else {
+      lv_label_set_text(homeTitleLabel, "Home");
+      lv_label_set_text(homeJobLabel, currentState.jobName);
+      lv_label_set_text_fmt(homePercentLabel, "%d%%", currentState.percent);
+      lv_bar_set_value(homeProgressBar, currentState.percent, LV_ANIM_OFF);
+      formatDuration(currentState.remainingMinutes, buffer, sizeof(buffer));
+      lv_label_set_text(homeTimeValue, buffer);
+      formatLayers(currentState, buffer, sizeof(buffer));
+      lv_label_set_text(homeLayersValue, buffer);
+      formatTemp(currentState.bedTemp, currentState.bedTargetTemp, buffer, sizeof(buffer));
+      lv_label_set_text(homeBedValue, buffer);
+      formatTemp(currentState.nozzleTemp, currentState.nozzleTargetTemp, buffer, sizeof(buffer));
+      lv_label_set_text(homeNozzleValue, buffer);
+    }
+  }
+
+  const uint8_t activeIdx = initializing || printerOffline
+                                ? 0
+                                : strcmp(currentState.stageText, "PAUSE") == 0
+                                      ? 0
+                                      : isHeating(currentState) ? 1
+                                                                : strcmp(currentState.stageText, "FINISH") == 0 ? 3 : 2;
+  for (uint8_t i = 0; i < 4; ++i) {
+    lv_obj_set_style_bg_opa(homeControlBars[i], i == activeIdx ? LV_OPA_COVER : LV_OPA_50, 0);
+  }
+
+  const bool dimSecondaryNav = activeSection == Section::Home && (initializing || printerOffline);
+  for (uint8_t i = 0; i < 5; ++i) {
+    const lv_opa_t opa = (!dimSecondaryNav || i == 0) ? LV_OPA_COVER : LV_OPA_50;
+    lv_obj_set_style_opa(navButtons[i], opa, 0);
+  }
+}
+
+void refreshTemps() {
+  char buffer[24];
+  pushTempSample();
+  for (uint8_t i = 0; i < kTempHistorySize; ++i) {
+    tempsNozzleSeries->y_points[i] = nozzleHistory[i];
+    tempsBedSeries->y_points[i] = bedHistory[i];
+  }
+  lv_chart_refresh(tempsChart);
+
+  formatTemp(currentState.nozzleTemp, currentState.nozzleTargetTemp, buffer, sizeof(buffer));
+  lv_label_set_text(tempsNozzleValue, buffer);
+  formatTemp(currentState.bedTemp, currentState.bedTargetTemp, buffer, sizeof(buffer));
+  lv_label_set_text(tempsBedValue, buffer);
+}
+
+void refreshPrint() {
+  char buffer[24];
+  lv_label_set_text(printJobLabel, currentState.jobName);
+  lv_label_set_text_fmt(printProgressValue, "%d%%", currentState.percent);
+  formatDuration(currentState.remainingMinutes, buffer, sizeof(buffer));
+  lv_label_set_text(printRemainValue, buffer);
+  formatLayers(currentState, buffer, sizeof(buffer));
+  lv_label_set_text(printLayersValue, buffer);
+  lv_label_set_text(printSpeedValue, speedText(currentState.speedLevel));
+  lv_label_set_text(printStateValue, statusText(currentState));
+}
+
+void refreshSystem() {
+  lv_label_set_text(systemWifiValue, currentState.wifiSignal);
+  lv_label_set_text(systemMqttValue, mqttStatus(currentState));
+  lv_label_set_text(systemRamValue, "35%");
+  lv_label_set_text(systemFlashValue, "40%");
+  lv_label_set_text_fmt(systemTypeValue, "Type %s", currentState.printType);
+  lv_label_set_text_fmt(systemCommandValue, "Cmd %s", currentState.lastCommand);
+
+  const uint8_t activeBrightnessIdx = brightnessPercent <= 33 ? 0 : brightnessPercent <= 66 ? 1 : 2;
+  for (uint8_t i = 0; i < 3; ++i) {
+    lv_obj_set_style_bg_color(systemBrightnessButtons[i], kAccent, 0);
+    lv_obj_set_style_bg_opa(systemBrightnessButtons[i], i == activeBrightnessIdx ? LV_OPA_50 : 38, 0);
+  }
+  lv_label_set_text(systemTouchValue, "Calibrate Touch");
+
+  const bool controlEnabled = canControlPrint(currentState);
+  lv_label_set_text(menuPauseLabel, isPaused(currentState) ? "Resume" : "Pause");
+  lv_obj_center(menuPauseLabel);
+  lv_obj_set_style_bg_color(menuPauseButton, kAccent, 0);
+  lv_obj_set_style_bg_opa(menuPauseButton, controlEnabled ? LV_OPA_50 : 24, 0);
+  lv_obj_set_style_bg_color(menuStopButton, kAccent, 0);
+  lv_obj_set_style_bg_opa(menuStopButton, controlEnabled ? LV_OPA_50 : 24, 0);
+  if (controlEnabled) {
+    lv_obj_add_flag(menuPauseButton, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(menuStopButton, LV_OBJ_FLAG_CLICKABLE);
+  } else {
+    lv_obj_clear_flag(menuPauseButton, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(menuStopButton, LV_OBJ_FLAG_CLICKABLE);
+  }
+
+  for (uint8_t i = 0; i < 4; ++i) {
+    lv_obj_set_style_bg_color(menuSpeedButtons[i], kAccent, 0);
+    const lv_opa_t baseOpa = (i + 1) == currentState.speedLevel ? LV_OPA_50 : 38;
+    lv_obj_set_style_bg_opa(menuSpeedButtons[i], controlEnabled ? baseOpa : 24, 0);
+    if (controlEnabled) {
+      lv_obj_add_flag(menuSpeedButtons[i], LV_OBJ_FLAG_CLICKABLE);
+    } else {
+      lv_obj_clear_flag(menuSpeedButtons[i], LV_OBJ_FLAG_CLICKABLE);
+    }
   }
 }
 
 }  // namespace
 
-void init() {
-  initStyles();
-
-  screenObj = lv_obj_create(nullptr);
-  lv_obj_remove_style_all(screenObj);
-  lv_obj_set_style_bg_color(screenObj, lv_color_hex(0x05070A), 0);
-  lv_obj_set_style_bg_opa(screenObj, LV_OPA_COVER, 0);
-
-  statusLabel = lv_label_create(screenObj);
-  lv_obj_set_style_text_font(statusLabel, &lv_font_montserrat_12, 0);
-  lv_label_set_text(statusLabel, "LIVE");
-  lv_obj_align(statusLabel, LV_ALIGN_TOP_RIGHT, -12, 6);
-
-  buildSummaryPage();
-  buildHeatingPage();
-  buildTempsPage();
-  buildDetailsPage();
-  buildIdlePage();
-  buildFinishPage();
-  buildNoticePage();
-  buildCalibrationOverlay();
-
-  tapLayer = lv_obj_create(screenObj);
-  lv_obj_remove_style_all(tapLayer);
-  lv_obj_set_size(tapLayer, kScreenW, kScreenH);
-  lv_obj_set_pos(tapLayer, 0, 0);
-  lv_obj_set_style_bg_opa(tapLayer, LV_OPA_TRANSP, 0);
-  lv_obj_add_flag(tapLayer, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(tapLayer, tapEventHandler, LV_EVENT_CLICKED, nullptr);
-
-  menuOverlay = lv_obj_create(screenObj);
-  lv_obj_remove_style_all(menuOverlay);
-  lv_obj_set_size(menuOverlay, kScreenW, kScreenH);
-  lv_obj_set_pos(menuOverlay, 0, 0);
-  lv_obj_set_style_bg_color(menuOverlay, lv_color_hex(0x030407), 0);
-  lv_obj_set_style_bg_opa(menuOverlay, LV_OPA_70, 0);
-  lv_obj_add_flag(menuOverlay, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(menuOverlay, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(menuOverlay, menuOverlayEventHandler, LV_EVENT_CLICKED, nullptr);
-
-  menuPanel = lv_obj_create(menuOverlay);
-  lv_obj_remove_style_all(menuPanel);
-  lv_obj_add_style(menuPanel, &cardStyle, 0);
-  lv_obj_set_size(menuPanel, 248, 254);
-  lv_obj_center(menuPanel);
-  lv_obj_add_flag(menuPanel, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(menuPanel, menuPanelEventHandler, LV_EVENT_CLICKED, nullptr);
-
-  menuTitle = lv_label_create(menuPanel);
-  lv_obj_set_style_text_font(menuTitle, &lv_font_montserrat_18, 0);
-  lv_obj_set_style_text_color(menuTitle, lv_color_hex(0xF5F7FA), 0);
-  lv_obj_set_pos(menuTitle, 14, 14);
-  lv_label_set_text(menuTitle, "Menu");
-
-  menuCloseBtn = createMenuButton(menuPanel, 194, 10, 40, 32, "X", MenuAction::Close);
-  lv_obj_set_style_bg_color(menuCloseBtn, lv_color_hex(0x2A1620), 0);
-
-  menuHint = lv_label_create(menuPanel);
-  lv_obj_set_style_text_font(menuHint, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(menuHint, lv_color_hex(0xD8DEE7), 0);
-  lv_obj_set_width(menuHint, 220);
-  lv_label_set_long_mode(menuHint, LV_LABEL_LONG_WRAP);
-  lv_obj_set_pos(menuHint, 14, 46);
-  lv_label_set_text(menuHint, "Pick a screen, set brightness, or run touch calibration.");
-
-  menuAutoBtn = createMenuButton(menuPanel, 14, 88, 104, 30, "Auto", MenuAction::AutoRotate);
-  menuSummaryBtn = createMenuButton(menuPanel, 130, 88, 104, 30, "Summary", MenuAction::Summary);
-  menuTempsBtn = createMenuButton(menuPanel, 14, 128, 104, 30, "Temps", MenuAction::Temps);
-  menuDetailsBtn = createMenuButton(menuPanel, 130, 128, 104, 30, "Details", MenuAction::Details);
-  menuBrightnessLowBtn = createActionButton(menuPanel, 14, 168, 68, 30, "Low", Action::SetBrightnessLow);
-  menuBrightnessMidBtn = createActionButton(menuPanel, 90, 168, 68, 30, "Mid", Action::SetBrightnessMid);
-  menuBrightnessMaxBtn = createActionButton(menuPanel, 166, 168, 68, 30, "Max", Action::SetBrightnessMax);
-  menuCalibrateBtn = lv_btn_create(menuPanel);
-  lv_obj_remove_style_all(menuCalibrateBtn);
-  lv_obj_add_style(menuCalibrateBtn, &cardStyle, 0);
-  lv_obj_set_size(menuCalibrateBtn, 220, 34);
-  lv_obj_set_pos(menuCalibrateBtn, 14, 208);
-  lv_obj_add_flag(menuCalibrateBtn, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(menuCalibrateBtn, calibrateButtonHandler, LV_EVENT_CLICKED, nullptr);
-  lv_obj_t *calLabel = lv_label_create(menuCalibrateBtn);
-  lv_obj_set_style_text_font(calLabel, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(calLabel, lv_color_hex(0xF5F7FA), 0);
-  lv_label_set_text(calLabel, "Calibrate Touch");
-  lv_obj_center(calLabel);
-  updateMenuButtons();
-
-  pageIndicatorTrack = lv_obj_create(screenObj);
-  lv_obj_remove_style_all(pageIndicatorTrack);
-  lv_obj_set_size(pageIndicatorTrack, kScreenW, 2);
-  lv_obj_set_pos(pageIndicatorTrack, 0, kScreenH - 2);
-  lv_obj_set_style_bg_color(pageIndicatorTrack, lv_color_hex(kTrackColor), 0);
-  lv_obj_set_style_bg_opa(pageIndicatorTrack, LV_OPA_COVER, 0);
-
-  pageIndicatorFill = lv_obj_create(screenObj);
-  lv_obj_remove_style_all(pageIndicatorFill);
-  lv_obj_set_size(pageIndicatorFill, 0, 2);
-  lv_obj_set_pos(pageIndicatorFill, 0, kScreenH - 2);
-  lv_obj_set_style_bg_color(pageIndicatorFill, lv_color_hex(kAccentColor), 0);
-  lv_obj_set_style_bg_opa(pageIndicatorFill, LV_OPA_COVER, 0);
-
-  setActiveSequence(ViewMode::Idle);
-  lv_scr_load(screenObj);
-}
-
-void applyState(const PrinterState &state) {
-  char buffer[96];
-  char prettyState[48];
-  char prettyType[48];
-  char doneAtText[32];
-  char idleTempText[48];
-  char heatingText[48];
-
-  const ViewMode mode = detectMode(state);
-  if (mode != currentMode || !pagerInitialized) setActiveSequence(mode);
-  updateMenuButtons();
-
-  lv_obj_set_style_text_color(statusLabel, state.stale ? lv_color_hex(0xD16B72) : lv_color_hex(kLiveColor), 0);
-  lv_label_set_text(statusLabel, state.stale ? "STALE" : "LIVE");
-
-  formatDisplayText(effectiveStage(state), prettyState, sizeof(prettyState));
-  formatDisplayText(state.printType, prettyType, sizeof(prettyType));
-  formatDoneAt(state, doneAtText, sizeof(doneAtText));
-
-  setLabelText(summaryStage, prettyState);
-  setLabelText(summaryJob, state.jobName);
-  lv_bar_set_value(summaryProgress, state.percent, LV_ANIM_OFF);
-  snprintf(buffer, sizeof(buffer), "%d%%", state.percent);
-  setLabelText(summaryPercent, buffer);
-  formatDuration(state.remainingMinutes, buffer, sizeof(buffer));
-  setLabelText(summaryEta, buffer);
-  snprintf(buffer, sizeof(buffer), "Done %s", doneAtText);
-  setLabelText(summaryDoneAt, buffer);
-  snprintf(buffer, sizeof(buffer), "%d/%d", state.currentLayer, state.totalLayers);
-  setLabelText(summaryLayers, buffer);
-
-  for (int i = 0; i < 4; ++i) lv_obj_set_style_bg_color(summaryTimeline[i], lv_color_hex(0x2A2230), 0);
-  lv_obj_set_style_bg_color(summaryTimeline[0], isHeatingState(state) ? lv_color_hex(kAccentColor) : lv_color_hex(kAccentSoft), 0);
-  lv_obj_set_style_bg_color(summaryTimeline[1], state.printing && !isPausedState(effectiveStage(state)) && !isFinishedState(effectiveStage(state)) && !isHeatingState(state) ? lv_color_hex(kAccentColor) : lv_color_hex(kAccentSoft), 0);
-  lv_obj_set_style_bg_color(summaryTimeline[2], isPausedState(effectiveStage(state)) ? lv_color_hex(kAccentColor) : lv_color_hex(kAccentSoft), 0);
-  lv_obj_set_style_bg_color(summaryTimeline[3], isFinishedState(effectiveStage(state)) ? lv_color_hex(kAccentColor) : lv_color_hex(kAccentSoft), 0);
-
-  snprintf(buffer, sizeof(buffer), "%.0f/%.0fC", state.nozzleTemp, state.nozzleTargetTemp);
-  setLabelText(heatingNozzle, buffer);
-  setLabelText(tempNozzle, buffer);
-  snprintf(buffer, sizeof(buffer), "%.0f/%.0fC", state.bedTemp, state.bedTargetTemp);
-  setLabelText(heatingBed, buffer);
-  setLabelText(tempBed, buffer);
-
-  if (mode == ViewMode::Heating) {
-    if ((state.nozzleTargetTemp - state.nozzleTemp) >= (state.bedTargetTemp - state.bedTemp)) {
-      snprintf(heatingText, sizeof(heatingText), "Nozzle to %.0fC", state.nozzleTargetTemp);
-    } else {
-      snprintf(heatingText, sizeof(heatingText), "Bed to %.0fC", state.bedTargetTemp);
-    }
-  } else {
-    snprintf(heatingText, sizeof(heatingText), "%s", state.jobName);
-  }
-  setLabelText(heatingSubtitle, heatingText);
-
-  if (state.percent != lastHistoryPercent || (lv_tick_get() - lastHistorySampleMs) >= 5000U) {
-    for (int i = 0; i < 19; ++i) {
-      nozzleHistory[i] = nozzleHistory[i + 1];
-      bedHistory[i] = bedHistory[i + 1];
-    }
-    nozzleHistory[19] = static_cast<lv_coord_t>(state.nozzleTemp);
-    bedHistory[19] = static_cast<lv_coord_t>(state.bedTemp);
-    lastHistoryPercent = state.percent;
-    lastHistorySampleMs = lv_tick_get();
-    if (tempChart != nullptr) lv_chart_refresh(tempChart);
-  }
-
-  setLabelText(detailState, prettyState);
-  setLabelText(detailWifi, state.wifiSignal);
-  setLabelText(detailJob, state.jobName);
-  setLabelText(detailType, prettyType);
-  setLabelText(detailSpeed, speedLabel(state.speedLevel));
-
-  setLabelText(idleStatus, mode == ViewMode::Idle ? "Ready" : prettyState);
-  setLabelText(idleJob, state.jobName);
-  snprintf(idleTempText, sizeof(idleTempText), "%.0fC nozzle  %.0fC bed", state.nozzleTemp, state.bedTemp);
-  setLabelText(idleTemp, idleTempText);
-
-  setLabelText(finishJob, state.jobName);
-  snprintf(buffer, sizeof(buffer), "%d/%d", state.currentLayer, state.totalLayers);
-  setLabelText(finishLayers, buffer);
-  setLabelText(finishType, prettyType);
-
-  setLabelText(tempLegendNozzle, "Pink: Nozzle");
-  setLabelText(tempLegendBed, "Blue: Bed");
-
-  updateNoticePage(state);
-  updateMenuTimeout();
-  updatePager();
-}
-
 void setActionHandler(ActionHandler handler) { actionHandler = handler; }
 
 void setBrightnessPercent(uint8_t percent) {
-  currentBrightnessPercent = percent;
-  updateMenuButtons();
+  brightnessPercent = percent;
+  if (!root) return;
+  refreshSystem();
+}
+
+void init() {
+  initStyles();
+  if (lv_disp_t *disp = lv_disp_get_default()) {
+    lv_disp_set_theme(disp, nullptr);
+  }
+
+  root = lv_obj_create(lv_scr_act());
+  lv_obj_remove_style_all(root);
+  lv_obj_add_style(root, &screenStyle, 0);
+  lv_obj_set_size(root, kScreenW, kScreenH);
+  lv_obj_set_pos(root, 0, 0);
+  lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+
+  initRail();
+  initHomePage();
+  initTempsPage();
+  initPrintPage();
+  initSystemPage();
+  initMenuPage();
+  initCalibrationConfirm();
+  initCalibrationOverlay();
+
+  showPage(Section::Home);
+  applyState(currentState);
+}
+
+void applyState(const PrinterState &state) {
+  currentState = state;
+  setLiveBadge(state.stale || !state.hasData);
+  refreshHome();
+  refreshTemps();
+  refreshPrint();
+  refreshSystem();
 }
 
 void showCalibrationStep(uint8_t step, uint8_t total, int x, int y) {
-  char buffer[32];
-  snprintf(buffer, sizeof(buffer), "%u / %u", static_cast<unsigned>(step), static_cast<unsigned>(total));
-  lv_label_set_text(calibrationTitle, "Touch Calibration");
-  lv_label_set_text(calibrationHint, "Tap the pink cross, then release.");
-  lv_label_set_text(calibrationStepLabel, buffer);
-  lv_obj_add_flag(calibrationStartBtn, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(calibrationCancelBtn, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_set_pos(calibrationCrossH, x - 13, y - 1);
-  lv_obj_set_pos(calibrationCrossV, x - 1, y - 13);
-  lv_obj_clear_flag(calibrationCrossH, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_clear_flag(calibrationCrossV, LV_OBJ_FLAG_HIDDEN);
-  setCalibrationVisible(true);
+  closeCalibrationConfirm();
+  lv_obj_clear_flag(calibrationOverlay, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(calibrationOverlay);
+  lv_label_set_text_fmt(calibrationStepLabel, "%u / %u", step, total);
+  lv_obj_set_pos(calibrationCross, x - 9, y - 9);
 }
 
-void hideCalibration() {
-  if (calibrationStartBtn != nullptr) lv_obj_add_flag(calibrationStartBtn, LV_OBJ_FLAG_HIDDEN);
-  if (calibrationCancelBtn != nullptr) lv_obj_add_flag(calibrationCancelBtn, LV_OBJ_FLAG_HIDDEN);
-  if (calibrationCrossH != nullptr) lv_obj_add_flag(calibrationCrossH, LV_OBJ_FLAG_HIDDEN);
-  if (calibrationCrossV != nullptr) lv_obj_add_flag(calibrationCrossV, LV_OBJ_FLAG_HIDDEN);
-  setCalibrationVisible(false);
-}
+void hideCalibration() { lv_obj_add_flag(calibrationOverlay, LV_OBJ_FLAG_HIDDEN); }
 
 }  // namespace ui

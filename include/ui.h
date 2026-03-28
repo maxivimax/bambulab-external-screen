@@ -11,6 +11,12 @@ enum class Action {
   SetBrightnessLow,
   SetBrightnessMid,
   SetBrightnessMax,
+  PauseOrResumePrint,
+  StopPrint,
+  SetSpeedSilent,
+  SetSpeedStandard,
+  SetSpeedSport,
+  SetSpeedLudicrous,
 };
 
 using ActionHandler = void (*)(Action action);

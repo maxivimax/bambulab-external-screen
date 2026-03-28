@@ -2,4 +2,7 @@
 .pio-core/
 compile_commands.json
 
+artifacts/live_state.txt
 node_modules
+.DS_Store
+.DS_Store

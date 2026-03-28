@@ -82,6 +82,7 @@ unsigned long lastMqttAttemptMs = 0;
 unsigned long lastPushallMs = 0;
 unsigned long lastTickMs = 0;
 unsigned long lastUiRefreshMs = 0;
+uint32_t mqttSequenceId = 1000;
 uint8_t currentBrightness = 192;
 SPIClass touchSpi(VSPI);
 lv_indev_drv_t indevDrv;
@@ -117,6 +118,15 @@ constexpr int kCalibrationTargetXs[4] = {24, LCD_HOR_RES - 25, LCD_HOR_RES - 25,
 constexpr int kCalibrationTargetYs[4] = {24, 24, LCD_VER_RES - 25, LCD_VER_RES - 25};
 
 bool readTouchRaw(int &rawX, int &rawY);
+void publishPauseOrResume();
+void publishStop();
+void publishSpeed(uint8_t speedLevel);
+
+const char *nextSequenceId() {
+  static char buffer[16];
+  snprintf(buffer, sizeof(buffer), "%lu", static_cast<unsigned long>(mqttSequenceId++));
+  return buffer;
+}
 
 String makeClientId() {
   const uint64_t chipId = ESP.getEfuseMac();
@@ -280,6 +290,24 @@ void handleUiAction(ui::Action action) {
       applyBrightness(logicalBrightnessToHardware(255));
       saveBrightnessPreference();
       break;
+    case ui::Action::PauseOrResumePrint:
+      publishPauseOrResume();
+      break;
+    case ui::Action::StopPrint:
+      publishStop();
+      break;
+    case ui::Action::SetSpeedSilent:
+      publishSpeed(1);
+      break;
+    case ui::Action::SetSpeedStandard:
+      publishSpeed(2);
+      break;
+    case ui::Action::SetSpeedSport:
+      publishSpeed(3);
+      break;
+    case ui::Action::SetSpeedLudicrous:
+      publishSpeed(4);
+      break;
   }
 }
 
@@ -427,6 +455,52 @@ void publishPushall() {
   const size_t len = serializeJson(doc, payload, sizeof(payload));
   mqttClient.publish(requestTopic.c_str(), reinterpret_cast<const uint8_t *>(payload), len);
   snprintf(printer.lastCommand, sizeof(printer.lastCommand), "%s", "pushall");
+}
+
+template <size_t N>
+bool publishPrintCommand(StaticJsonDocument<N> &doc, const char *command, const char *lastCommand,
+                         const char *param = nullptr, const char *reason = nullptr) {
+  if (!mqttClient.connected()) return false;
+
+  JsonObject print = doc.createNestedObject("print");
+  print["sequence_id"] = nextSequenceId();
+  print["command"] = command;
+  if (param) print["param"] = param;
+  if (reason) print["reason"] = reason;
+
+  char payload[256];
+  const size_t len = serializeJson(doc, payload, sizeof(payload));
+  const bool published =
+      mqttClient.publish(requestTopic.c_str(), reinterpret_cast<const uint8_t *>(payload), len);
+  if (published) {
+    snprintf(printer.lastCommand, sizeof(printer.lastCommand), "%s", lastCommand);
+    printer.lastUpdateMs = millis();
+  }
+  return published;
+}
+
+void publishPauseOrResume() {
+  if (!printer.hasData || printer.stale || !printer.printing) return;
+  StaticJsonDocument<128> doc;
+  const bool paused = strcmp(printer.stageText, "PAUSE") == 0;
+  publishPrintCommand(doc, paused ? "resume" : "pause", paused ? "resume" : "pause");
+}
+
+void publishStop() {
+  if (!printer.hasData || printer.stale || !printer.printing) return;
+  StaticJsonDocument<128> doc;
+  publishPrintCommand(doc, "stop", "stop", nullptr, "success");
+}
+
+void publishSpeed(uint8_t speedLevel) {
+  if (!printer.hasData || printer.stale || !printer.printing) return;
+  if (speedLevel < 1 || speedLevel > 4) return;
+  StaticJsonDocument<128> doc;
+  char param[2];
+  snprintf(param, sizeof(param), "%u", speedLevel);
+  if (publishPrintCommand(doc, "print_speed", "print_speed", param)) {
+    printer.speedLevel = speedLevel;
+  }
 }
 
 void connectWifi() {

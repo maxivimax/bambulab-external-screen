@@ -1,4 +1,6 @@
-# BambuLab A1 screen for BPI-Leaf-S3 + Waveshare 2.4" ILI9341
+# BlPad - just one another screen for BambuLab A1
+
+![Hero image](assets/readme-hero.png)
 
 This project now uses a shared `LVGL` UI layer so the same screen can run:
 
