@@ -25,6 +25,8 @@ void init();
 void applyState(const PrinterState &state);
 void setActionHandler(ActionHandler handler);
 void setBrightnessPercent(uint8_t percent);
+void setSystemServiceInfo(const char *ip, const char *serial, const char *heap, const char *firmware,
+                          const char *mqtt, const char *updated);
 void showCalibrationStep(uint8_t step, uint8_t total, int x, int y);
 void hideCalibration();
 

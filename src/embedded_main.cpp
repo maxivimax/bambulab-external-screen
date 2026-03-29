@@ -150,6 +150,38 @@ uint8_t logicalBrightnessToHardware(uint8_t logicalValue) {
   return LCD_BL_INVERT ? static_cast<uint8_t>(255U - logicalValue) : logicalValue;
 }
 
+void formatLastUpdateAge(char *buffer, size_t size, unsigned long now) {
+  if (!printer.hasData || printer.lastUpdateMs == 0) {
+    snprintf(buffer, size, "%s", "Never");
+    return;
+  }
+  const unsigned long ageMs = now - printer.lastUpdateMs;
+  const unsigned long ageSec = ageMs / 1000UL;
+  if (ageSec < 60UL) {
+    snprintf(buffer, size, "%lus ago", ageSec);
+    return;
+  }
+  const unsigned long ageMin = ageSec / 60UL;
+  if (ageMin < 60UL) {
+    snprintf(buffer, size, "%lum ago", ageMin);
+    return;
+  }
+  const unsigned long ageHour = ageMin / 60UL;
+  snprintf(buffer, size, "%luh ago", ageHour);
+}
+
+void refreshSystemServiceInfo(unsigned long now) {
+  char ip[24];
+  char heap[24];
+  char updated[24];
+  snprintf(ip, sizeof(ip), "%s",
+           WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "-");
+  snprintf(heap, sizeof(heap), "%lu KB", static_cast<unsigned long>(ESP.getFreeHeap() / 1024U));
+  formatLastUpdateAge(updated, sizeof(updated), now);
+  ui::setSystemServiceInfo(ip, BAMBU_PRINTER_SERIAL, heap, APP_FIRMWARE_VERSION,
+                           mqttClient.connected() ? "Connected" : "Disconnected", updated);
+}
+
 int extrapolateRaw(int screenValueA, int screenValueB, int rawValueA, int rawValueB, int targetScreenValue) {
   const int screenSpan = screenValueB - screenValueA;
   if (screenSpan == 0) return rawValueA;
@@ -584,6 +616,7 @@ void setupDisplay() {
 
   ui::init();
   ui::setActionHandler(handleUiAction);
+  refreshSystemServiceInfo(millis());
   ui::applyState(printer);
 }
 
@@ -646,6 +679,7 @@ void loop() {
 
   printer.stale = !printer.hasData || (now - printer.lastUpdateMs) > STALE_AFTER_MS;
   if ((now - lastUiRefreshMs) >= UI_REFRESH_MS) {
+    refreshSystemServiceInfo(now);
     ui::applyState(printer);
     lastUiRefreshMs = now;
   }

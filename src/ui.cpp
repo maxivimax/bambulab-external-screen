@@ -27,6 +27,12 @@ PrinterState currentState = makeDefaultPrinterState();
 Section activeSection = Section::Home;
 uint8_t brightnessPercent = 75;
 SystemPane activeSystemPane = SystemPane::Info;
+char systemIpText[32] = "-";
+char systemSerialText[32] = "-";
+char systemHeapText[24] = "-";
+char systemFirmwareText[24] = "-";
+char systemMqttText[24] = "-";
+char systemUpdatedText[24] = "-";
 
 lv_style_t screenStyle;
 lv_style_t railStyle;
@@ -104,13 +110,13 @@ lv_obj_t *printLayersValue = nullptr;
 lv_obj_t *printSpeedValue = nullptr;
 lv_obj_t *printStateValue = nullptr;
 
-lv_obj_t *systemWifiValue = nullptr;
+lv_obj_t *systemIpValue = nullptr;
+lv_obj_t *systemSerialValue = nullptr;
+lv_obj_t *systemHeapValue = nullptr;
+lv_obj_t *systemFirmwareValue = nullptr;
 lv_obj_t *systemMqttValue = nullptr;
-lv_obj_t *systemRamValue = nullptr;
-lv_obj_t *systemFlashValue = nullptr;
+lv_obj_t *systemUpdatedValue = nullptr;
 lv_obj_t *systemTouchValue = nullptr;
-lv_obj_t *systemTypeValue = nullptr;
-lv_obj_t *systemCommandValue = nullptr;
 lv_obj_t *systemBrightnessButtons[3] = {};
 
 lv_obj_t *menuBrightnessValue = nullptr;
@@ -965,22 +971,12 @@ void initSystemPage() {
   lv_obj_clear_flag(systemInfoPane, LV_OBJ_FLAG_SCROLLABLE);
 
   createText(systemInfoPane, 10, 10, "System", &homeTitleStyle);
-  createSystemInfoCard(systemInfoPane, 10, 40, 108, 46, "Wifi", &ui_icon_wifi_fill, &systemWifiValue, "-49 dBm");
-  createSystemInfoCard(systemInfoPane, 122, 40, 108, 46, "Status", &ui_icon_wifi_fill, &systemMqttValue,
-                       "Connected");
-  createSystemInfoCard(systemInfoPane, 10, 90, 108, 46, "RAM", &ui_icon_sdcard, &systemRamValue, "35%");
-  createSystemInfoCard(systemInfoPane, 122, 90, 108, 46, "Flash", &ui_icon_sdcard, &systemFlashValue, "40%");
-
-  lv_obj_t *foot = lv_obj_create(systemInfoPane);
-  lv_obj_remove_style_all(foot);
-  lv_obj_add_style(foot, &homeCardTopStyle, 0);
-  lv_obj_set_pos(foot, 10, 140);
-  lv_obj_set_size(foot, 220, 50);
-  lv_obj_clear_flag(foot, LV_OBJ_FLAG_SCROLLABLE);
-  systemTypeValue = createText(foot, 0, 0, "Type idle", &homeBodyStyle);
-  lv_obj_t *serverIcon = createImage(foot, 176, 0, &ui_icon_server);
-  lv_img_set_zoom(serverIcon, 149);
-  systemCommandValue = createText(foot, 0, 20, "Cmd push_status", &homeBodyStyle);
+  createSystemInfoCard(systemInfoPane, 10, 40, 108, 46, "IP", &ui_icon_wifi_fill, &systemIpValue, "-");
+  createSystemInfoCard(systemInfoPane, 122, 40, 108, 46, "Serial", &ui_icon_server, &systemSerialValue, "-");
+  createSystemInfoCard(systemInfoPane, 10, 90, 108, 46, "Heap", &ui_icon_sdcard, &systemHeapValue, "-");
+  createSystemInfoCard(systemInfoPane, 122, 90, 108, 46, "Firmware", &ui_icon_info, &systemFirmwareValue, "-");
+  createSystemInfoCard(systemInfoPane, 10, 140, 108, 46, "MQTT", &ui_icon_wifi_fill, &systemMqttValue, "-");
+  createSystemInfoCard(systemInfoPane, 122, 140, 108, 46, "Updated", &ui_icon_timer, &systemUpdatedValue, "-");
 
   systemSettingsPane = lv_obj_create(contentWrap);
   lv_obj_remove_style_all(systemSettingsPane);
@@ -1281,12 +1277,12 @@ void refreshPrint() {
 }
 
 void refreshSystem() {
-  lv_label_set_text(systemWifiValue, currentState.wifiSignal);
-  lv_label_set_text(systemMqttValue, mqttStatus(currentState));
-  lv_label_set_text(systemRamValue, "35%");
-  lv_label_set_text(systemFlashValue, "40%");
-  lv_label_set_text_fmt(systemTypeValue, "Type %s", currentState.printType);
-  lv_label_set_text_fmt(systemCommandValue, "Cmd %s", currentState.lastCommand);
+  lv_label_set_text(systemIpValue, systemIpText);
+  lv_label_set_text(systemSerialValue, systemSerialText);
+  lv_label_set_text(systemHeapValue, systemHeapText);
+  lv_label_set_text(systemFirmwareValue, systemFirmwareText);
+  lv_label_set_text(systemMqttValue, systemMqttText);
+  lv_label_set_text(systemUpdatedValue, systemUpdatedText);
 
   const uint8_t activeBrightnessIdx = brightnessPercent <= 33 ? 0 : brightnessPercent <= 66 ? 1 : 2;
   for (uint8_t i = 0; i < 3; ++i) {
@@ -1328,6 +1324,18 @@ void setActionHandler(ActionHandler handler) { actionHandler = handler; }
 
 void setBrightnessPercent(uint8_t percent) {
   brightnessPercent = percent;
+  if (!root) return;
+  refreshSystem();
+}
+
+void setSystemServiceInfo(const char *ip, const char *serial, const char *heap, const char *firmware,
+                          const char *mqtt, const char *updated) {
+  snprintf(systemIpText, sizeof(systemIpText), "%s", ip ? ip : "-");
+  snprintf(systemSerialText, sizeof(systemSerialText), "%s", serial ? serial : "-");
+  snprintf(systemHeapText, sizeof(systemHeapText), "%s", heap ? heap : "-");
+  snprintf(systemFirmwareText, sizeof(systemFirmwareText), "%s", firmware ? firmware : "-");
+  snprintf(systemMqttText, sizeof(systemMqttText), "%s", mqtt ? mqtt : "-");
+  snprintf(systemUpdatedText, sizeof(systemUpdatedText), "%s", updated ? updated : "-");
   if (!root) return;
   refreshSystem();
 }

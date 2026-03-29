@@ -10,6 +10,7 @@ static constexpr uint16_t BAMBU_MQTT_PORT = 8883;
 static constexpr char BAMBU_PRINTER_SERIAL[] = "";
 static constexpr char BAMBU_ACCESS_CODE[] = "";
 static constexpr char BAMBU_MQTT_USERNAME[] = "bblp";
+static constexpr char APP_FIRMWARE_VERSION[] = "0.2.1";
 
 // --- Waveshare 2.4" ILI9341 wiring to BPI-Leaf-S3. ---
 // --- Change these pins to match your actual wiring. ---
