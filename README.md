@@ -20,6 +20,15 @@ It currently displays:
 - current and total layers
 - Wi-Fi signal reported by the printer
 
+The ESP32 firmware can also optionally run a very small Telegram bot bridge for:
+
+- `/status`
+- `/pause`
+- `/resume`
+- `/stop`
+- `/speed silent|standard|sport|ludicrous`
+- notifications for `paused`, `resumed`, `finished`, and `offline/online`
+
 ## How it works
 
 The firmware connects to your Wi-Fi, opens a TLS MQTT connection to the printer on port `8883`, subscribes to:
@@ -77,6 +86,9 @@ Edit [include/app_config.h](/Users/princeess/Work/bambulab-screen/include/app_co
 - printer serial
 - Bambu LAN access code
 - display pins if they differ
+- optionally `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to enable the built-in bot
+
+If `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` is empty, Telegram support stays disabled.
 
 ## Desktop preview
 

@@ -56,3 +56,8 @@ static constexpr uint32_t MQTT_RETRY_MS = 5000;
 static constexpr uint32_t UI_REFRESH_MS = 500;
 static constexpr uint32_t PUSHALL_INTERVAL_MS = 30000;
 static constexpr uint32_t STALE_AFTER_MS = 45000;
+
+// --- Optional Telegram bot bridge. Leave empty to disable. ---
+static constexpr char TELEGRAM_BOT_TOKEN[] = "";
+static constexpr char TELEGRAM_CHAT_ID[] = "";
+static constexpr uint32_t TELEGRAM_POLL_MS = 3000;

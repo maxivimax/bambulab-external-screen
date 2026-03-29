@@ -27,6 +27,8 @@ PrinterState currentState = makeDefaultPrinterState();
 Section activeSection = Section::Home;
 uint8_t brightnessPercent = 75;
 SystemPane activeSystemPane = SystemPane::Info;
+char telegramStatusText[24] = "Disabled";
+char telegramUsernameText[40] = "-";
 
 lv_style_t screenStyle;
 lv_style_t railStyle;
@@ -110,7 +112,7 @@ lv_obj_t *systemRamValue = nullptr;
 lv_obj_t *systemFlashValue = nullptr;
 lv_obj_t *systemTouchValue = nullptr;
 lv_obj_t *systemTypeValue = nullptr;
-lv_obj_t *systemCommandValue = nullptr;
+lv_obj_t *systemTelegramValue = nullptr;
 lv_obj_t *systemBrightnessButtons[3] = {};
 
 lv_obj_t *menuBrightnessValue = nullptr;
@@ -971,16 +973,9 @@ void initSystemPage() {
   createSystemInfoCard(systemInfoPane, 10, 90, 108, 46, "RAM", &ui_icon_sdcard, &systemRamValue, "35%");
   createSystemInfoCard(systemInfoPane, 122, 90, 108, 46, "Flash", &ui_icon_sdcard, &systemFlashValue, "40%");
 
-  lv_obj_t *foot = lv_obj_create(systemInfoPane);
-  lv_obj_remove_style_all(foot);
-  lv_obj_add_style(foot, &homeCardTopStyle, 0);
-  lv_obj_set_pos(foot, 10, 140);
-  lv_obj_set_size(foot, 220, 50);
-  lv_obj_clear_flag(foot, LV_OBJ_FLAG_SCROLLABLE);
-  systemTypeValue = createText(foot, 0, 0, "Type idle", &homeBodyStyle);
-  lv_obj_t *serverIcon = createImage(foot, 176, 0, &ui_icon_server);
-  lv_img_set_zoom(serverIcon, 149);
-  systemCommandValue = createText(foot, 0, 20, "Cmd push_status", &homeBodyStyle);
+  createSystemInfoCard(systemInfoPane, 10, 140, 108, 50, "Type", &ui_icon_server, &systemTypeValue, "idle");
+  createSystemInfoCard(systemInfoPane, 122, 140, 108, 50, "Telegram", &ui_icon_server, &systemTelegramValue,
+                       "Disabled / -");
 
   systemSettingsPane = lv_obj_create(contentWrap);
   lv_obj_remove_style_all(systemSettingsPane);
@@ -1285,8 +1280,8 @@ void refreshSystem() {
   lv_label_set_text(systemMqttValue, mqttStatus(currentState));
   lv_label_set_text(systemRamValue, "35%");
   lv_label_set_text(systemFlashValue, "40%");
-  lv_label_set_text_fmt(systemTypeValue, "Type %s", currentState.printType);
-  lv_label_set_text_fmt(systemCommandValue, "Cmd %s", currentState.lastCommand);
+  lv_label_set_text(systemTypeValue, currentState.printType);
+  lv_label_set_text(systemTelegramValue, strcmp(telegramUsernameText, "-") != 0 ? telegramUsernameText : telegramStatusText);
 
   const uint8_t activeBrightnessIdx = brightnessPercent <= 33 ? 0 : brightnessPercent <= 66 ? 1 : 2;
   for (uint8_t i = 0; i < 3; ++i) {
@@ -1328,6 +1323,13 @@ void setActionHandler(ActionHandler handler) { actionHandler = handler; }
 
 void setBrightnessPercent(uint8_t percent) {
   brightnessPercent = percent;
+  if (!root) return;
+  refreshSystem();
+}
+
+void setTelegramStatus(const char *status, const char *username) {
+  snprintf(telegramStatusText, sizeof(telegramStatusText), "%s", status ? status : "Disabled");
+  snprintf(telegramUsernameText, sizeof(telegramUsernameText), "%s", username ? username : "-");
   if (!root) return;
   refreshSystem();
 }

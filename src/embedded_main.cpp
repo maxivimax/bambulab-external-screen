@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
 #include <LovyanGFX.hpp>
 #include <Preferences.h>
 #include <PubSubClient.h>
@@ -8,6 +9,7 @@
 #include <WiFiClientSecure.h>
 #include <lvgl.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <esp_heap_caps.h>
 
 #include "app_config.h"
@@ -71,6 +73,7 @@ class LGFX : public lgfx::LGFX_Device {
 LGFX lcd;
 WiFiClientSecure secureClient;
 PubSubClient mqttClient(secureClient);
+WiFiClientSecure telegramClient;
 PrinterState printer = makeDefaultPrinterState();
 
 String reportTopic;
@@ -82,11 +85,29 @@ unsigned long lastMqttAttemptMs = 0;
 unsigned long lastPushallMs = 0;
 unsigned long lastTickMs = 0;
 unsigned long lastUiRefreshMs = 0;
+unsigned long lastTelegramPollMs = 0;
+unsigned long lastTelegramProfileMs = 0;
 uint32_t mqttSequenceId = 1000;
+int64_t telegramLastUpdateId = 0;
 uint8_t currentBrightness = 192;
 SPIClass touchSpi(VSPI);
 lv_indev_drv_t indevDrv;
 Preferences preferences;
+char telegramBotUsername[40] = "-";
+char telegramBotStatus[24] = "Disabled";
+volatile bool telegramUiDirty = true;
+
+enum class PendingTelegramAction : uint8_t {
+  None,
+  PauseResume,
+  Stop,
+  SpeedSilent,
+  SpeedStandard,
+  SpeedSport,
+  SpeedLudicrous,
+};
+
+volatile PendingTelegramAction pendingTelegramAction = PendingTelegramAction::None;
 
 lv_disp_draw_buf_t drawBuf;
 lv_color_t *drawBuffer = nullptr;
@@ -122,10 +143,334 @@ void publishPauseOrResume();
 void publishStop();
 void publishSpeed(uint8_t speedLevel);
 
+bool telegramEnabled() {
+  return TELEGRAM_BOT_TOKEN[0] != '\0' && TELEGRAM_CHAT_ID[0] != '\0';
+}
+
+void updateTelegramUiStatus() { telegramUiDirty = true; }
+
 const char *nextSequenceId() {
   static char buffer[16];
   snprintf(buffer, sizeof(buffer), "%lu", static_cast<unsigned long>(mqttSequenceId++));
   return buffer;
+}
+
+String urlEncode(const char *input) {
+  String encoded;
+  while (*input) {
+    const unsigned char c = static_cast<unsigned char>(*input++);
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' ||
+        c == '_' || c == '.' || c == '~') {
+      encoded += static_cast<char>(c);
+    } else if (c == ' ') {
+      encoded += "%20";
+    } else {
+      char hex[4];
+      snprintf(hex, sizeof(hex), "%%%02X", c);
+      encoded += hex;
+    }
+  }
+  return encoded;
+}
+
+const char *speedTextLocal(int speedLevel) {
+  switch (speedLevel) {
+    case 1:
+      return "Silent";
+    case 2:
+      return "Standard";
+    case 3:
+      return "Sport";
+    case 4:
+      return "Ludicrous";
+    default:
+      return "Normal";
+  }
+}
+
+void formatDurationLocal(int minutes, char *buffer, size_t size) {
+  if (minutes <= 0) {
+    snprintf(buffer, size, "Now");
+    return;
+  }
+  const int hours = minutes / 60;
+  const int mins = minutes % 60;
+  if (hours > 0) {
+    snprintf(buffer, size, "%dh %02dm", hours, mins);
+  } else {
+    snprintf(buffer, size, "%dm", mins);
+  }
+}
+
+void sendTelegramMessage(const String &text) {
+  if (!telegramEnabled() || WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  telegramClient.setInsecure();
+  http.setConnectTimeout(400);
+  http.setTimeout(500);
+  const String url = String("https://api.telegram.org/bot") + TELEGRAM_BOT_TOKEN + "/sendMessage";
+  if (!http.begin(telegramClient, url)) return;
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  const String body = String("chat_id=") + TELEGRAM_CHAT_ID + "&text=" + urlEncode(text.c_str());
+  http.POST(body);
+  http.end();
+}
+
+void updateTelegramProfile() {
+  if (!telegramEnabled() || WiFi.status() != WL_CONNECTED) {
+    snprintf(telegramBotStatus, sizeof(telegramBotStatus), "%s", telegramEnabled() ? "Offline" : "Disabled");
+    if (!telegramEnabled()) snprintf(telegramBotUsername, sizeof(telegramBotUsername), "%s", "-");
+    updateTelegramUiStatus();
+    return;
+  }
+
+  const unsigned long now = millis();
+  if ((now - lastTelegramProfileMs) < 60000UL) return;
+  lastTelegramProfileMs = now;
+
+  HTTPClient http;
+  telegramClient.setInsecure();
+  http.setConnectTimeout(400);
+  http.setTimeout(500);
+  const String url = String("https://api.telegram.org/bot") + TELEGRAM_BOT_TOKEN + "/getMe";
+  if (!http.begin(telegramClient, url)) {
+    snprintf(telegramBotStatus, sizeof(telegramBotStatus), "%s", "Error");
+    updateTelegramUiStatus();
+    return;
+  }
+
+  const int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    snprintf(telegramBotStatus, sizeof(telegramBotStatus), "%s", "Error");
+    updateTelegramUiStatus();
+    return;
+  }
+
+  DynamicJsonDocument doc(2048);
+  DeserializationError err = deserializeJson(doc, http.getStream());
+  http.end();
+  if (err || !doc["ok"].as<bool>()) {
+    snprintf(telegramBotStatus, sizeof(telegramBotStatus), "%s", "Error");
+    updateTelegramUiStatus();
+    return;
+  }
+
+  snprintf(telegramBotStatus, sizeof(telegramBotStatus), "%s", "Enabled");
+  if (doc["result"]["username"].is<const char *>()) {
+    snprintf(telegramBotUsername, sizeof(telegramBotUsername), "@%s", doc["result"]["username"].as<const char *>());
+  } else {
+    snprintf(telegramBotUsername, sizeof(telegramBotUsername), "%s", "-");
+  }
+  updateTelegramUiStatus();
+}
+
+void buildStatusMessage(char *buffer, size_t size) {
+  char remaining[24];
+  char layers[24];
+  formatDurationLocal(printer.remainingMinutes, remaining, sizeof(remaining));
+  if (printer.totalLayers > 0) {
+    snprintf(layers, sizeof(layers), "%d/%d", printer.currentLayer, printer.totalLayers);
+  } else {
+    snprintf(layers, sizeof(layers), "%d", printer.currentLayer);
+  }
+
+  snprintf(buffer, size,
+           "State: %s\nJob: %s\nProgress: %d%%\nRemaining: %s\nLayers: %s\nNozzle: %.0f/%.0f C\nBed: %.0f/%.0f C"
+           "\nSpeed: %s\nWiFi: %s",
+           printer.stageText, printer.jobName, printer.percent, remaining, layers, printer.nozzleTemp,
+           printer.nozzleTargetTemp, printer.bedTemp, printer.bedTargetTemp, speedTextLocal(printer.speedLevel),
+           printer.wifiSignal);
+}
+
+void requestTelegramAction(PendingTelegramAction action) {
+  if (pendingTelegramAction == PendingTelegramAction::None) {
+    pendingTelegramAction = action;
+  }
+}
+
+void handleTelegramCommand(const char *messageText) {
+  if (!messageText || messageText[0] == '\0') return;
+
+  char command[96];
+  snprintf(command, sizeof(command), "%s", messageText);
+  for (char *p = command; *p; ++p) {
+    *p = static_cast<char>(tolower(static_cast<unsigned char>(*p)));
+  }
+
+  if (strcmp(command, "/status") == 0) {
+    char status[256];
+    buildStatusMessage(status, sizeof(status));
+    sendTelegramMessage(status);
+    return;
+  }
+  if (strcmp(command, "/pause") == 0) {
+    if (printer.printing && strcmp(printer.stageText, "PAUSE") != 0) {
+      requestTelegramAction(PendingTelegramAction::PauseResume);
+      sendTelegramMessage("Pause requested.");
+    } else {
+      sendTelegramMessage("Pause is not available right now.");
+    }
+    return;
+  }
+  if (strcmp(command, "/resume") == 0) {
+    if (printer.printing && strcmp(printer.stageText, "PAUSE") == 0) {
+      requestTelegramAction(PendingTelegramAction::PauseResume);
+      sendTelegramMessage("Resume requested.");
+    } else {
+      sendTelegramMessage("Resume is not available right now.");
+    }
+    return;
+  }
+  if (strcmp(command, "/stop") == 0) {
+    if (printer.printing) {
+      requestTelegramAction(PendingTelegramAction::Stop);
+      sendTelegramMessage("Stop requested.");
+    } else {
+      sendTelegramMessage("Stop is not available right now.");
+    }
+    return;
+  }
+  if (strcmp(command, "/speed_silent") == 0 || strcmp(command, "/speed silent") == 0) {
+    requestTelegramAction(PendingTelegramAction::SpeedSilent);
+    sendTelegramMessage("Speed set to Silent.");
+    return;
+  }
+  if (strcmp(command, "/speed_standard") == 0 || strcmp(command, "/speed standard") == 0) {
+    requestTelegramAction(PendingTelegramAction::SpeedStandard);
+    sendTelegramMessage("Speed set to Standard.");
+    return;
+  }
+  if (strcmp(command, "/speed_sport") == 0 || strcmp(command, "/speed sport") == 0) {
+    requestTelegramAction(PendingTelegramAction::SpeedSport);
+    sendTelegramMessage("Speed set to Sport.");
+    return;
+  }
+  if (strcmp(command, "/speed_ludicrous") == 0 || strcmp(command, "/speed ludicrous") == 0) {
+    requestTelegramAction(PendingTelegramAction::SpeedLudicrous);
+    sendTelegramMessage("Speed set to Ludicrous.");
+    return;
+  }
+  sendTelegramMessage(
+      "Commands: /status, /pause, /resume, /stop, /speed_silent, /speed_standard, /speed_sport, "
+      "/speed_ludicrous");
+}
+
+void pollTelegram() {
+  if (!telegramEnabled()) {
+    snprintf(telegramBotStatus, sizeof(telegramBotStatus), "%s", "Disabled");
+    snprintf(telegramBotUsername, sizeof(telegramBotUsername), "%s", "-");
+    updateTelegramUiStatus();
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    snprintf(telegramBotStatus, sizeof(telegramBotStatus), "%s", "Offline");
+    updateTelegramUiStatus();
+    return;
+  }
+  const unsigned long now = millis();
+  if ((now - lastTelegramPollMs) < TELEGRAM_POLL_MS) return;
+  lastTelegramPollMs = now;
+
+  HTTPClient http;
+  telegramClient.setInsecure();
+  http.setConnectTimeout(400);
+  http.setTimeout(500);
+  const String url = String("https://api.telegram.org/bot") + TELEGRAM_BOT_TOKEN +
+                     "/getUpdates?offset=" + String(telegramLastUpdateId + 1) + "&timeout=0";
+  if (!http.begin(telegramClient, url)) {
+    snprintf(telegramBotStatus, sizeof(telegramBotStatus), "%s", "Error");
+    updateTelegramUiStatus();
+    return;
+  }
+  const int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    snprintf(telegramBotStatus, sizeof(telegramBotStatus), "%s", "Error");
+    updateTelegramUiStatus();
+    return;
+  }
+
+  DynamicJsonDocument doc(8192);
+  DeserializationError err = deserializeJson(doc, http.getStream());
+  http.end();
+  if (err || !doc["ok"].as<bool>()) {
+    snprintf(telegramBotStatus, sizeof(telegramBotStatus), "%s", "Error");
+    updateTelegramUiStatus();
+    return;
+  }
+
+  if (strcmp(telegramBotStatus, "Enabled") != 0 && strcmp(telegramBotUsername, "-") == 0) {
+    snprintf(telegramBotStatus, sizeof(telegramBotStatus), "%s", "Enabled");
+    updateTelegramUiStatus();
+  }
+
+  JsonArray results = doc["result"].as<JsonArray>();
+  for (JsonObject update : results) {
+    const int64_t updateId = update["update_id"] | 0;
+    if (updateId > telegramLastUpdateId) telegramLastUpdateId = updateId;
+
+    JsonObject message = update["message"].as<JsonObject>();
+    if (message.isNull()) continue;
+
+    const char *chatIdRaw = message["chat"]["id"].is<int64_t>() ? nullptr : nullptr;
+    (void)chatIdRaw;
+    char chatIdBuffer[32];
+    if (message["chat"]["id"].is<int64_t>()) {
+      snprintf(chatIdBuffer, sizeof(chatIdBuffer), "%lld",
+               static_cast<long long>(message["chat"]["id"].as<int64_t>()));
+    } else {
+      continue;
+    }
+    if (strcmp(chatIdBuffer, TELEGRAM_CHAT_ID) != 0) continue;
+
+    if (!message["text"].is<const char *>()) continue;
+    handleTelegramCommand(message["text"].as<const char *>());
+  }
+}
+
+void notifyTelegramStateChange(const PrinterState &previous, const PrinterState &next) {
+  if (!telegramEnabled()) return;
+  if (previous.hasData != next.hasData && !next.hasData) return;
+
+  if (previous.stale != next.stale) {
+    if (next.stale) {
+      sendTelegramMessage("Printer went offline.");
+    } else if (next.hasData) {
+      sendTelegramMessage("Printer is back online.");
+    }
+  }
+
+  if (strcmp(previous.stageText, next.stageText) == 0) return;
+  if (strcmp(next.stageText, "PAUSE") == 0) {
+    sendTelegramMessage(String("Print paused: ") + next.jobName);
+  } else if (strcmp(next.stageText, "FINISH") == 0) {
+    sendTelegramMessage(String("Print finished: ") + next.jobName);
+  } else if (strcmp(next.stageText, "RUNNING") == 0 && strcmp(previous.stageText, "PAUSE") == 0) {
+    sendTelegramMessage(String("Print resumed: ") + next.jobName);
+  }
+}
+
+void telegramTask(void *) {
+  PrinterState previousState = makeDefaultPrinterState();
+  bool previousStateValid = false;
+
+  for (;;) {
+    updateTelegramProfile();
+    pollTelegram();
+
+    PrinterState snapshot = printer;
+    if (!previousStateValid) {
+      previousState = snapshot;
+      previousStateValid = true;
+    } else {
+      notifyTelegramStateChange(previousState, snapshot);
+      previousState = snapshot;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(250));
+  }
 }
 
 String makeClientId() {
@@ -584,6 +929,7 @@ void setupDisplay() {
 
   ui::init();
   ui::setActionHandler(handleUiAction);
+  updateTelegramUiStatus();
   ui::applyState(printer);
 }
 
@@ -616,6 +962,9 @@ void setup() {
   WiFi.disconnect(true, true);
   lastTickMs = millis();
   lastUiRefreshMs = millis();
+  if (telegramEnabled()) {
+    xTaskCreatePinnedToCore(telegramTask, "telegram", 8192, nullptr, 1, nullptr, 0);
+  }
 }
 
 void loop() {
@@ -644,8 +993,39 @@ void loop() {
     }
   }
 
+  const PendingTelegramAction action = pendingTelegramAction;
+  if (action != PendingTelegramAction::None) {
+    pendingTelegramAction = PendingTelegramAction::None;
+    switch (action) {
+      case PendingTelegramAction::PauseResume:
+        publishPauseOrResume();
+        break;
+      case PendingTelegramAction::Stop:
+        publishStop();
+        break;
+      case PendingTelegramAction::SpeedSilent:
+        publishSpeed(1);
+        break;
+      case PendingTelegramAction::SpeedStandard:
+        publishSpeed(2);
+        break;
+      case PendingTelegramAction::SpeedSport:
+        publishSpeed(3);
+        break;
+      case PendingTelegramAction::SpeedLudicrous:
+        publishSpeed(4);
+        break;
+      case PendingTelegramAction::None:
+        break;
+    }
+  }
+
   printer.stale = !printer.hasData || (now - printer.lastUpdateMs) > STALE_AFTER_MS;
   if ((now - lastUiRefreshMs) >= UI_REFRESH_MS) {
+    if (telegramUiDirty) {
+      telegramUiDirty = false;
+      ui::setTelegramStatus(telegramBotStatus, telegramBotUsername);
+    }
     ui::applyState(printer);
     lastUiRefreshMs = now;
   }
